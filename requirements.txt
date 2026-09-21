@@ -1,0 +1,3 @@
+python-telegram-bot[job-queue]>=21,<23
+gspread>=6
+tzdata
