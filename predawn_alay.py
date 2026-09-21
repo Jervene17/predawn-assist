@@ -70,7 +70,7 @@ DEFAULTS = {
     "enabled": True,
 }
 
-PRAY_TEXT = "Pray for the rest to also wake up or call them personally"
+PRAY_TEXT = "Let's start our day with prayer"
 
 HEADERS = {
     "PA_Groups": ["chat_id", "title", "wake", "end", "tz", "alay_wait", "attempt_wait",
