@@ -869,6 +869,7 @@ async def cmd_join(update, context):
 
 HELP_TEXT = (
     "<b>Predawn wake-up commands</b>\n"
+    "/pd_menu - tap buttons instead of typing commands\n"
     "/pd_join - get the join button\n"
     "/pd_schedule - this week's Alay schedule\n"
     "/pd_members - who has joined\n"
@@ -1199,6 +1200,64 @@ async def cmd_resume(update, context):
 
 
 # --------------------------------------------------------------------------------------
+# Inline-keyboard menu (buttons that trigger the commands above)
+# --------------------------------------------------------------------------------------
+MENU_ACTIONS = {
+    "join": cmd_join, "schedule": cmd_schedule, "members": cmd_members,
+    "skip": cmd_skip, "unskip": cmd_unskip, "leave": cmd_leave,
+    "status": cmd_status, "settings": cmd_settings,
+    "setup": cmd_setup, "regen": cmd_regen, "start": cmd_start_now,
+    "stop": cmd_stop, "pause": cmd_pause, "resume": cmd_resume,
+}
+
+
+def _btn(label, action):
+    return InlineKeyboardButton(label, callback_data=f"pdm:{action}")
+
+
+def build_menu(admin):
+    rows = [
+        [_btn("🌅 Join", "join"), _btn("📅 Schedule", "schedule")],
+        [_btn("👥 Members", "members"), _btn("📊 Status", "status")],
+        [_btn("😴 Skip today", "skip"), _btn("🔁 Unskip", "unskip")],
+        [_btn("🚪 Leave", "leave"), _btn("⚙️ Settings", "settings")],
+    ]
+    if admin:
+        rows += [
+            [_btn("🛠 Setup", "setup"), _btn("🔀 Regen", "regen")],
+            [_btn("▶️ Start now", "start"), _btn("⏹ Stop", "stop")],
+            [_btn("⏸ Pause", "pause"), _btn("▶️ Resume", "resume")],
+        ]
+    return InlineKeyboardMarkup(rows)
+
+
+async def cmd_menu(update, context):
+    chat = update.effective_chat
+    if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await update.effective_message.reply_text("Please use this command inside your group.")
+        return
+    admin = await is_admin(context.bot, chat.id, update.effective_user.id)
+    await update.effective_message.reply_text(
+        "<b>Predawn wake-up menu</b>\nTap a button below.",
+        parse_mode=ParseMode.HTML, reply_markup=build_menu(admin))
+
+
+async def cb_menu(update, context):
+    q = update.callback_query
+    try:
+        _, action = q.data.split(":", 1)
+    except ValueError:
+        await q.answer()
+        return
+    fn = MENU_ACTIONS.get(action)
+    if not fn:
+        await q.answer()
+        return
+    await q.answer()
+    await fn(update, context)
+
+
+# --------------------------------------------------------------------------------------
 # Wiring
 # --------------------------------------------------------------------------------------
 def register(application, spreadsheet, handle_plain_start=False, handler_group=-1):
@@ -1216,10 +1275,12 @@ def register(application, spreadsheet, handle_plain_start=False, handler_group=-
         ("pd_members", cmd_members), ("pd_skip", cmd_skip), ("pd_unskip", cmd_unskip),
         ("pd_leave", cmd_leave), ("pd_status", cmd_status), ("pd_start", cmd_start_now),
         ("pd_stop", cmd_stop), ("pd_pause", cmd_pause), ("pd_resume", cmd_resume),
+        ("pd_menu", cmd_menu),
     ]:
         add(CommandHandler(name, fn))
     add(CallbackQueryHandler(cb_alay, pattern=r"^pdaw:"))
     add(CallbackQueryHandler(cb_result, pattern=r"^pd(ok|no):"))
+    add(CallbackQueryHandler(cb_menu, pattern=r"^pdm:"))
     application.job_queue.run_repeating(tick, interval=30, first=10, name="predawn_tick")
     application.job_queue.run_repeating(flush_job, interval=20, first=20, name="predawn_flush")
 
