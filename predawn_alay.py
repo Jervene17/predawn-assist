@@ -968,9 +968,7 @@ async def cmd_start(update, context):
     args = context.args or []
     if not (args and args[0].startswith("join_")):
         if HANDLE_PLAIN_START:
-            await update.message.reply_text(
-                "Hi! I'm the Predawn wake-up bot. Ask your group admin to run /pd_setup in the group, "
-                "then tap the Join button there.\n\n" + "Commands are listed with /pd_help.")
+            await show_start_menu(update, context)
         return
     try:
         cid = int(args[0][5:])
@@ -1003,8 +1001,34 @@ async def cmd_start(update, context):
     await update.message.reply_text(
         f"✅ You're in the Predawn wake-up for <b>{esc(g['title'])}</b>, {esc(user.first_name)}.\n"
         f"Wake time: {g['wake']} (Mon-Sat). Please keep notifications on for this chat so I can wake you up "
-        f"when you're the Alay. /pd_help lists the commands.", parse_mode=ParseMode.HTML)
+        f"when you're the Alay.", parse_mode=ParseMode.HTML)
+    admin = await is_admin(context.bot, cid, user.id)
+    await update.message.reply_text(
+        f"<b>Predawn wake-up menu</b> - {esc(g['title'])}\nTap a button below.",
+        parse_mode=ParseMode.HTML, reply_markup=build_menu(admin, cid))
     raise ApplicationHandlerStop
+
+
+async def show_start_menu(update, context):
+    """Plain /start (no join link): if this person is already tied to a group (as a
+    member or an admin), show the menu right away instead of the generic welcome text."""
+    uid = update.effective_user.id
+    cids = await resolve_menu_group(context.bot, uid)
+    if not cids:
+        await update.message.reply_text(
+            "Hi! I'm the Predawn wake-up bot. Ask your group admin to run /pd_setup in the group, "
+            "then tap the Join button there.\n\n" + "Commands are listed with /pd_help.")
+        return
+    if len(cids) > 1:
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton(S.groups[c]["title"], callback_data=f"pdm:menu:{c}")]
+                                   for c in cids])
+        await update.message.reply_text("Which group?", reply_markup=kb)
+        return
+    cid = cids[0]
+    admin = await is_admin(context.bot, cid, uid)
+    await update.message.reply_text(
+        f"<b>Predawn wake-up menu</b> - {esc(S.groups[cid]['title'])}\nTap a button below.",
+        parse_mode=ParseMode.HTML, reply_markup=build_menu(admin, cid))
 
 
 def settings_text(g):
