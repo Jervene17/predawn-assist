@@ -520,25 +520,38 @@ async def dm_alay(bot, cid, st, m, nag=False):
 
 
 async def activate_alay(bot, cid, st, d, prev_name=None):
-    """Pick the Alay (scheduled first, then a backup) and DM them. Loops if a DM can't be delivered."""
+    """Pick the Alay (scheduled first, then a backup) and DM them. Loops if a DM can't be delivered.
+    Once everyone in the pool has had an untaken turn, cycles back to the very first Alay assigned
+    today (if they still haven't confirmed) and keeps nagging them until the run's end time."""
     g = S.groups[cid]
     while True:
         m, backup = choose_alay(cid, d, st["alay_tried"])
+        cycling_back = False
         if not m:
-            await finish(bot, cid, st)
-            return False
+            first_uid = st["alay_tried"][0] if st["alay_tried"] else None
+            cand = member(cid, first_uid) if first_uid else None
+            already_awake = first_uid in {a["uid"] for a in st["awake"]} if first_uid else True
+            if not cand or not cand["active"] or is_skipping(cand, d) or already_awake:
+                await finish(bot, cid, st)
+                return False
+            m, backup, cycling_back = cand, False, True
         if backup:
             S.schedule.append({"chat_id": cid, "date": d.isoformat(), "user_id": m["user_id"],
                                "name": m["name"], "status": "backup"})
             S.dirty.add("PA_Schedule")
         st["alay_id"] = m["user_id"]
-        st["alay_tried"].append(m["user_id"])
+        if m["user_id"] not in st["alay_tried"]:
+            st["alay_tried"].append(m["user_id"])
         st["phase"] = "alay_wait"
         st["alay_deadline"] = in_minutes(g, g["alay_wait"])
         st["next_nag"] = in_minutes(g, g["nag_min"])
         S.dirty.add("PA_State")
         if await dm_alay(bot, cid, st, m):
-            if prev_name:
+            if prev_name and cycling_back:
+                await say(bot, cid, f"⚠️ {esc(prev_name)} didn't respond. Back to "
+                                    f"<b>{esc(m['name'])}</b> - still waiting on them.")
+                await refresh_list(bot, cid, st)
+            elif prev_name:
                 await say(bot, cid, f"⚠️ {esc(prev_name)} didn't respond. "
                                     f"<b>{esc(m['name'])}</b> is now the Alay.")
                 await refresh_list(bot, cid, st)
@@ -680,9 +693,9 @@ async def advance(bot, cid, st):
             prev = st["alay_id"]
             set_row_status(cid, d, prev, "missed")
             S.add_log(cid, "alay_missed", prev)
-            for uid, mid in st["alay_msgs"]:
-                await strip_kb(bot, uid, mid)
-            st["alay_msgs"] = []
+            # Deliberately NOT stripping/clearing alay_msgs here: someone who missed their
+            # turn should still be able to tap their old "I'm awake" button if they wake up
+            # late, so it needs to stay live.
             await activate_alay(bot, cid, st, d, prev_name=name_of(cid, prev))
         elif now >= from_iso(st["next_nag"]):
             await dm_alay(bot, cid, st, member(cid, st["alay_id"]), nag=True)
@@ -741,21 +754,35 @@ async def cb_alay(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     async with LOCK:
         st = S.state.get(cid)
-        if (not st or st["date"] != day or st["phase"] != "alay_wait"
-                or q.from_user.id != st["alay_id"]):
+        uid = q.from_user.id
+        # Anyone who was ever assigned Alay duty today can still confirm, even after
+        # being superseded (e.g. they were asleep and only just saw the message) - as
+        # long as the run hasn't finished for the day.
+        if not st or st["date"] != day or st["phase"] == "done" or uid not in st["alay_tried"]:
             await q.answer("This button is no longer active.")
+            return
+        if uid in {a["uid"] for a in st["awake"]}:
+            await q.answer("You're already marked awake. Thank you!")
             return
         await q.answer("Thank you! 🌅")
         g = S.groups[cid]
-        uid = q.from_user.id
         d = date.fromisoformat(day)
+        starting_now = st["phase"] == "alay_wait"
         st["awake"].append({"uid": uid, "ts": now_local(g).isoformat()})
         set_row_status(cid, d, uid, "served")
-        st["phase"] = "chain"
+        if starting_now:
+            st["phase"] = "chain"
         S.dirty.add("PA_State")
         S.add_log(cid, "alay_awake", uid)
+        # Strip only this person's own button(s); leave anyone else's alay button live in
+        # case they, too, wake up late and want to confirm.
+        remaining = []
         for u, mid in st["alay_msgs"]:
-            await strip_kb(context.bot, u, mid)
+            if u == uid:
+                await strip_kb(context.bot, u, mid)
+            else:
+                remaining.append([u, mid])
+        st["alay_msgs"] = remaining
         try:
             await q.edit_message_text("✅ Thank you! I'll send you someone to call next.")
         except TelegramError:
@@ -764,7 +791,10 @@ async def cb_alay(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not st["pray"]:
             st["pray"] = True
             await say(context.bot, cid, f"🙏 <b>{esc(name_of(cid, uid))}</b> is up! {PRAY_TEXT}.")
-        await next_pair(context.bot, cid, st, prefer=uid)
+        elif not starting_now:
+            await say(context.bot, cid, f"🙌 <b>{esc(name_of(cid, uid))}</b> just confirmed awake too.")
+        if starting_now or st.get("cur") is None:
+            await next_pair(context.bot, cid, st, prefer=uid)
 
 
 async def cb_result(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -818,8 +848,9 @@ async def is_admin(bot, cid, uid):
     return cm.status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER)
 
 
-async def group_ctx(update, context, admin=False, need_setup=True):
-    """Common guard. Returns chat_id or None (after replying)."""
+async def group_only_ctx(update, context, admin=False, need_setup=True):
+    """Guard for the two commands that must still be typed inside the group itself
+    (/pd_setup and /pd_join). Returns chat_id or None (after replying)."""
     chat = update.effective_chat
     if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
         await update.effective_message.reply_text("Please use this command inside your group.")
@@ -833,6 +864,41 @@ async def group_ctx(update, context, admin=False, need_setup=True):
     return chat.id
 
 
+async def priv_ctx(update, context, admin=False, action=None):
+    """Guard for every other command, which now only work from a private chat with the
+    bot. Figures out which group the command applies to from the user's membership (or
+    admin status, if admin=True) and returns that chat_id - or None after replying with
+    an explanation, an error, or (if the user is in more than one group) a picker."""
+    chat = update.effective_chat
+    if chat.type != ChatType.PRIVATE:
+        await update.effective_message.reply_text(
+            "Let's do that in a private chat - tap my name above, then send the command "
+            "(or /pd_menu) there.")
+        return None
+    forced = getattr(context, "_pd_forced_cid", None)
+    if forced is not None:
+        return forced
+    uid = update.effective_user.id
+    if admin:
+        cids = [cid for cid in S.groups if await is_admin(context.bot, cid, uid)]
+    else:
+        cids = sorted({m["chat_id"] for m in S.members if m["user_id"] == uid})
+    if not cids:
+        await update.effective_message.reply_text(
+            "You're not an admin of any group I'm set up in." if admin else
+            "You haven't joined a Predawn group yet. Ask your group admin to post the Join button.")
+        return None
+    if len(cids) == 1:
+        return cids[0]
+    if not action:
+        await update.effective_message.reply_text("You're in more than one group - please use /pd_menu.")
+        return None
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton(S.groups[c]["title"], callback_data=f"pdm:{action}:{c}")]
+                               for c in cids])
+    await update.effective_message.reply_text("You're in more than one group - which one?", reply_markup=kb)
+    return None
+
+
 async def send_join_prompt(update, context, cid):
     url = f"https://t.me/{context.bot.username}?start=join_{cid}"
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("🌅 Join Predawn wake-up", url=url)]])
@@ -843,7 +909,7 @@ async def send_join_prompt(update, context, cid):
 
 
 async def cmd_setup(update, context):
-    cid = await group_ctx(update, context, admin=True, need_setup=False)
+    cid = await group_only_ctx(update, context, admin=True, need_setup=False)
     if cid is None:
         return
     async with LOCK:
@@ -856,21 +922,25 @@ async def cmd_setup(update, context):
     g = S.groups[cid]
     await update.effective_message.reply_text(
         f"✅ Predawn wake-up is set up for this group.\nWake time: {g['wake']}, end time: {g['end']} "
-        f"({g['tz']}). Change them with /pd_set wake HH:MM and /pd_set end HH:MM.\n\n"
-        f"Everyone must join below (Mon-Sat runs).")
+        f"({g['tz']}). DM me privately and use /pd_set wake HH:MM or /pd_set end HH:MM to change them.\n\n"
+        f"Everyone must join below (Mon-Sat runs). From here on, manage things by messaging me "
+        f"privately - this group will only show the Join button and the weekly schedule.")
     await send_join_prompt(update, context, cid)
 
 
 async def cmd_join(update, context):
-    cid = await group_ctx(update, context)
+    cid = await group_only_ctx(update, context)
     if cid is not None:
         await send_join_prompt(update, context, cid)
 
 
 HELP_TEXT = (
-    "<b>Predawn wake-up commands</b>\n"
-    "/pd_menu - tap buttons instead of typing commands\n"
-    "/pd_join - get the join button\n"
+    "<b>In the group</b>\n"
+    "/pd_setup - admin runs this once to set the group up\n"
+    "/pd_join - posts the Join button\n"
+    "(the weekly Alay schedule also posts here automatically)\n\n"
+    "<b>Everything else - message me privately</b>\n"
+    "DM me and send /pd_menu for buttons, or type any of these here:\n"
     "/pd_schedule - this week's Alay schedule\n"
     "/pd_members - who has joined\n"
     "/pd_skip [date...] - skip today (or given YYYY-MM-DD dates)\n"
@@ -878,8 +948,7 @@ HELP_TEXT = (
     "/pd_leave - leave the wake-up rotation\n"
     "/pd_status - what's happening now\n"
     "/pd_settings - show settings\n\n"
-    "<b>Admins</b>\n"
-    "/pd_setup - set this group up\n"
+    "<b>Admins (also DM me for these)</b>\n"
     "/pd_set wake|end HH:MM  |  tz Area/City  |  alay_wait|attempt_wait|attempts|nag N\n"
     "/pd_regen - reshuffle the remaining days\n"
     "/pd_start - start today's run now (testing)\n"
@@ -947,7 +1016,7 @@ def settings_text(g):
 
 
 async def cmd_settings(update, context):
-    cid = await group_ctx(update, context)
+    cid = await priv_ctx(update, context, action="settings")
     if cid is not None:
         await update.effective_message.reply_text(settings_text(S.groups[cid]), parse_mode=ParseMode.HTML)
 
@@ -987,7 +1056,7 @@ def apply_setting(g, key, value):
 
 
 async def cmd_set(update, context, forced_key=None):
-    cid = await group_ctx(update, context, admin=True)
+    cid = await priv_ctx(update, context, admin=True, action="set")
     if cid is None:
         return
     args = context.args or []
@@ -1018,7 +1087,7 @@ async def cmd_setend(update, context):
 
 
 async def cmd_schedule(update, context):
-    cid = await group_ctx(update, context)
+    cid = await priv_ctx(update, context, action="schedule")
     if cid is None:
         return
     g = S.groups[cid]
@@ -1035,7 +1104,7 @@ async def cmd_schedule(update, context):
 
 
 async def cmd_regen(update, context):
-    cid = await group_ctx(update, context, admin=True)
+    cid = await priv_ctx(update, context, admin=True, action="regen")
     if cid is None:
         return
     g = S.groups[cid]
@@ -1058,7 +1127,7 @@ async def cmd_regen(update, context):
 
 
 async def cmd_members(update, context):
-    cid = await group_ctx(update, context)
+    cid = await priv_ctx(update, context, action="members")
     if cid is None:
         return
     g = S.groups[cid]
@@ -1077,7 +1146,7 @@ async def cmd_members(update, context):
 
 
 async def cmd_skip(update, context):
-    cid = await group_ctx(update, context)
+    cid = await priv_ctx(update, context, action="skip")
     if cid is None:
         return
     g = S.groups[cid]
@@ -1107,7 +1176,7 @@ async def cmd_skip(update, context):
 
 
 async def cmd_unskip(update, context):
-    cid = await group_ctx(update, context)
+    cid = await priv_ctx(update, context, action="unskip")
     if cid is None:
         return
     async with LOCK:
@@ -1119,7 +1188,7 @@ async def cmd_unskip(update, context):
 
 
 async def cmd_leave(update, context):
-    cid = await group_ctx(update, context)
+    cid = await priv_ctx(update, context, action="leave")
     if cid is None:
         return
     async with LOCK:
@@ -1131,7 +1200,7 @@ async def cmd_leave(update, context):
 
 
 async def cmd_status(update, context):
-    cid = await group_ctx(update, context)
+    cid = await priv_ctx(update, context, action="status")
     if cid is None:
         return
     g = S.groups[cid]
@@ -1153,7 +1222,7 @@ async def cmd_status(update, context):
 
 
 async def cmd_start_now(update, context):
-    cid = await group_ctx(update, context, admin=True)
+    cid = await priv_ctx(update, context, admin=True, action="start")
     if cid is None:
         return
     async with LOCK:
@@ -1170,7 +1239,7 @@ async def cmd_start_now(update, context):
 
 
 async def cmd_stop(update, context):
-    cid = await group_ctx(update, context, admin=True)
+    cid = await priv_ctx(update, context, admin=True, action="stop")
     if cid is None:
         return
     async with LOCK:
@@ -1181,8 +1250,8 @@ async def cmd_stop(update, context):
             await update.effective_message.reply_text("Nothing is running.")
 
 
-async def _set_enabled(update, context, value):
-    cid = await group_ctx(update, context, admin=True)
+async def _set_enabled(update, context, value, action):
+    cid = await priv_ctx(update, context, admin=True, action=action)
     if cid is None:
         return
     async with LOCK:
@@ -1192,60 +1261,98 @@ async def _set_enabled(update, context, value):
 
 
 async def cmd_pause(update, context):
-    await _set_enabled(update, context, False)
+    await _set_enabled(update, context, False, "pause")
 
 
 async def cmd_resume(update, context):
-    await _set_enabled(update, context, True)
+    await _set_enabled(update, context, True, "resume")
 
 
 # --------------------------------------------------------------------------------------
 # Inline-keyboard menu (buttons that trigger the commands above)
 # --------------------------------------------------------------------------------------
 MENU_ACTIONS = {
-    "join": cmd_join, "schedule": cmd_schedule, "members": cmd_members,
+    "menu": None,  # filled in below, once cmd_menu exists
+    "schedule": cmd_schedule, "members": cmd_members,
     "skip": cmd_skip, "unskip": cmd_unskip, "leave": cmd_leave,
-    "status": cmd_status, "settings": cmd_settings,
-    "setup": cmd_setup, "regen": cmd_regen, "start": cmd_start_now,
+    "status": cmd_status, "settings": cmd_settings, "set": cmd_set,
+    "regen": cmd_regen, "start": cmd_start_now,
     "stop": cmd_stop, "pause": cmd_pause, "resume": cmd_resume,
 }
 
 
-def _btn(label, action):
-    return InlineKeyboardButton(label, callback_data=f"pdm:{action}")
+def _btn(label, action, cid):
+    # Every button carries the resolved group id, so tapping it never has to
+    # re-resolve (and possibly re-ask) which group it applies to.
+    return InlineKeyboardButton(label, callback_data=f"pdm:{action}:{cid}")
 
 
-def build_menu(admin):
+def build_menu(admin, cid):
     rows = [
-        [_btn("🌅 Join", "join"), _btn("📅 Schedule", "schedule")],
-        [_btn("👥 Members", "members"), _btn("📊 Status", "status")],
-        [_btn("😴 Skip today", "skip"), _btn("🔁 Unskip", "unskip")],
-        [_btn("🚪 Leave", "leave"), _btn("⚙️ Settings", "settings")],
+        [_btn("📅 Schedule", "schedule", cid), _btn("👥 Members", "members", cid)],
+        [_btn("📊 Status", "status", cid), _btn("⚙️ Settings", "settings", cid)],
+        [_btn("😴 Skip today", "skip", cid), _btn("🔁 Unskip", "unskip", cid)],
+        [_btn("🚪 Leave", "leave", cid)],
     ]
     if admin:
         rows += [
-            [_btn("🛠 Setup", "setup"), _btn("🔀 Regen", "regen")],
-            [_btn("▶️ Start now", "start"), _btn("⏹ Stop", "stop")],
-            [_btn("⏸ Pause", "pause"), _btn("▶️ Resume", "resume")],
+            [_btn("🔀 Regen", "regen", cid), _btn("▶️ Start now", "start", cid)],
+            [_btn("⏹ Stop", "stop", cid)],
+            [_btn("⏸ Pause", "pause", cid), _btn("▶️ Resume", "resume", cid)],
         ]
     return InlineKeyboardMarkup(rows)
 
 
+async def resolve_menu_group(bot, uid):
+    """Every group this person could plausibly want the menu for: groups they've
+    joined as a member, plus groups they admin (even if they never personally
+    joined the rotation)."""
+    member_cids = {m["chat_id"] for m in S.members if m["user_id"] == uid}
+    admin_cids = set()
+    for cid in S.groups:
+        if await is_admin(bot, cid, uid):
+            admin_cids.add(cid)
+    return sorted(member_cids | admin_cids)
+
+
 async def cmd_menu(update, context):
     chat = update.effective_chat
-    if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
-        await update.effective_message.reply_text("Please use this command inside your group.")
+    if chat.type != ChatType.PRIVATE:
+        await update.effective_message.reply_text(
+            "Let's do that in a private chat - tap my name above and send /pd_menu there.")
         return
-    admin = await is_admin(context.bot, chat.id, update.effective_user.id)
+    uid = update.effective_user.id
+    forced = getattr(context, "_pd_forced_cid", None)
+    if forced is not None:
+        cids = [forced]
+    else:
+        cids = await resolve_menu_group(context.bot, uid)
+        if not cids:
+            await update.effective_message.reply_text(
+                "I don't see you in any Predawn group yet. Ask your group admin for the Join button.")
+            return
+        if len(cids) > 1:
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton(S.groups[c]["title"], callback_data=f"pdm:menu:{c}")]
+                                       for c in cids])
+            await update.effective_message.reply_text("Which group?", reply_markup=kb)
+            return
+    cid = cids[0]
+    admin = await is_admin(context.bot, cid, uid)
     await update.effective_message.reply_text(
-        "<b>Predawn wake-up menu</b>\nTap a button below.",
-        parse_mode=ParseMode.HTML, reply_markup=build_menu(admin))
+        f"<b>Predawn wake-up menu</b> - {esc(S.groups[cid]['title'])}\nTap a button below.",
+        parse_mode=ParseMode.HTML, reply_markup=build_menu(admin, cid))
 
 
-async def cb_menu(update, context):
+MENU_ACTIONS["menu"] = cmd_menu
+
+
+async def cb_dispatch(update, context):
+    """Handles both the main menu's buttons and the 'which group?' picker buttons -
+    both are just callback_data of the form pdm:<action>:<chat_id>."""
     q = update.callback_query
     try:
-        _, action = q.data.split(":", 1)
+        _, action, cid = q.data.split(":", 2)
+        cid = int(cid)
     except ValueError:
         await q.answer()
         return
@@ -1254,7 +1361,11 @@ async def cb_menu(update, context):
         await q.answer()
         return
     await q.answer()
-    await fn(update, context)
+    context._pd_forced_cid = cid
+    try:
+        await fn(update, context)
+    finally:
+        context._pd_forced_cid = None
 
 
 # --------------------------------------------------------------------------------------
@@ -1280,7 +1391,7 @@ def register(application, spreadsheet, handle_plain_start=False, handler_group=-
         add(CommandHandler(name, fn))
     add(CallbackQueryHandler(cb_alay, pattern=r"^pdaw:"))
     add(CallbackQueryHandler(cb_result, pattern=r"^pd(ok|no):"))
-    add(CallbackQueryHandler(cb_menu, pattern=r"^pdm:"))
+    add(CallbackQueryHandler(cb_dispatch, pattern=r"^pdm:"))
     application.job_queue.run_repeating(tick, interval=30, first=10, name="predawn_tick")
     application.job_queue.run_repeating(flush_job, interval=20, first=20, name="predawn_flush")
 
