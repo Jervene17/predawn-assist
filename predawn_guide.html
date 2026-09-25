@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Predawn Wake-Up Bot — Guide</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #171a21;
+    --border: #262b36;
+    --text: #e7e9ee;
+    --muted: #9aa3b2;
+    --accent: #f5a623;
+    --accent2: #5fb0ff;
+    --code-bg: #10131a;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.6;
+  }
+  header {
+    padding: 48px 24px 24px;
+    text-align: center;
+    border-bottom: 1px solid var(--border);
+  }
+  header h1 {
+    margin: 0 0 8px;
+    font-size: 1.8rem;
+  }
+  header p {
+    color: var(--muted);
+    margin: 0;
+  }
+  .wrap {
+    max-width: 780px;
+    margin: 0 auto;
+    padding: 32px 20px 80px;
+  }
+  nav.toc {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 16px 20px;
+    margin-bottom: 32px;
+  }
+  nav.toc h2 { font-size: 1rem; margin: 0 0 8px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+  nav.toc ul { margin: 0; padding-left: 20px; columns: 2; }
+  nav.toc a { color: var(--accent2); text-decoration: none; }
+  nav.toc a:hover { text-decoration: underline; }
+  section { margin-bottom: 40px; }
+  h2 {
+    font-size: 1.3rem;
+    border-left: 4px solid var(--accent);
+    padding-left: 12px;
+    margin-bottom: 16px;
+  }
+  h3 { font-size: 1.05rem; color: var(--accent2); margin-top: 24px; }
+  p { color: var(--text); }
+  .muted { color: var(--muted); }
+  code {
+    background: var(--code-bg);
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-family: "SF Mono", Menlo, Consolas, monospace;
+    font-size: 0.92em;
+    color: #ffd479;
+  }
+  pre {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 14px 16px;
+    overflow-x: auto;
+  }
+  pre code { background: none; padding: 0; color: #d7dbe4; }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 12px 0 20px;
+    font-size: 0.95rem;
+  }
+  th, td {
+    text-align: left;
+    padding: 8px 10px;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+  }
+  th { color: var(--muted); font-weight: 600; }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 18px 20px;
+    margin: 16px 0;
+  }
+  .card.warn { border-color: #6b4a1a; background: #221a0f; }
+  .card.tip { border-color: #1a4a3a; background: #0f2219; }
+  .badge {
+    display: inline-block;
+    font-size: 0.75rem;
+    padding: 2px 8px;
+    border-radius: 999px;
+    background: #2a2f3a;
+    color: var(--muted);
+    margin-left: 6px;
+  }
+  .badge.admin { background: #3a2417; color: #f5a623; }
+  footer {
+    text-align: center;
+    color: var(--muted);
+    font-size: 0.85rem;
+    padding: 24px;
+    border-top: 1px solid var(--border);
+  }
+  a { color: var(--accent2); }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>🌅 Predawn Wake-Up Bot</h1>
+  <p>How the Alay wake-up relay works, and every command available.</p>
+</header>
+
+<div class="wrap">
+
+  <nav class="toc">
+    <h2>Contents</h2>
+    <ul>
+      <li><a href="#overview">Overview</a></li>
+      <li><a href="#setup">First-time setup</a></li>
+      <li><a href="#joining">Joining</a></li>
+      <li><a href="#morning">A typical morning</a></li>
+      <li><a href="#group-commands">Group commands</a></li>
+      <li><a href="#dm-commands">Private (DM) commands</a></li>
+      <li><a href="#admin-commands">Admin-only commands</a></li>
+      <li><a href="#settings">Settings reference</a></li>
+      <li><a href="#faq">FAQ / troubleshooting</a></li>
+    </ul>
+  </nav>
+
+  <section id="overview">
+    <h2>Overview</h2>
+    <p>
+      The bot runs a <strong>predawn wake-up relay</strong> for a group, Monday–Saturday.
+      Each day, one member — the <strong>Alay</strong> — is scheduled to wake up first.
+      Once the Alay confirms they're awake, the bot hands them names of other members to
+      call on Telegram, one at a time, until everyone in the group has been woken up or
+      the group's end time is reached.
+    </p>
+    <p class="muted">
+      Everything happens through <strong>private messages (DMs)</strong> with the bot —
+      the group chat itself only ever shows the Join button and the weekly schedule.
+    </p>
+  </section>
+
+  <section id="setup">
+    <h2>First-time setup</h2>
+    <ol>
+      <li>An admin runs <code>/pd_setup</code> inside the group, once.</li>
+      <li>The bot posts a <strong>Join</strong> button in the group.</li>
+      <li>Every member taps it, which opens a private chat with the bot, and presses
+        <strong>Start</strong> there.</li>
+      <li>That's it — the bot can now DM that person when it's their turn.</li>
+    </ol>
+    <div class="card warn">
+      <strong>Important:</strong> if a member never presses <em>Start</em> in their private
+      chat with the bot, the bot cannot message them, and they'll be skipped when the
+      schedule is built.
+    </div>
+  </section>
+
+  <section id="joining">
+    <h2>Joining</h2>
+    <p>
+      Anyone can join or re-join at any time by tapping the Join button in the group
+      (post it again with <code>/pd_join</code>), or an admin can prompt everyone at once
+      with <code>/pd_rejoin</code> — useful right after the bot has been updated or
+      redeployed, since it gives people a fresh reason to open their DM with the bot again.
+    </p>
+    <div class="card tip">
+      Tapping either button always opens Telegram's private chat screen with a
+      pre-filled <code>/start</code> command. The one thing nobody can skip is pressing
+      Telegram's own <strong>Start</strong> button once — that's a Telegram requirement,
+      not something the bot can automate away.
+    </div>
+  </section>
+
+  <section id="morning">
+    <h2>A typical morning</h2>
+    <ol>
+      <li>At the group's wake time, the bot DMs that day's scheduled Alay.</li>
+      <li>The Alay taps <strong>"I'm awake"</strong>.</li>
+      <li>The group is notified, and the Alay is privately given the name of one other
+        member to call on Telegram.</li>
+      <li>The Alay reports back: <strong>awake</strong> or <strong>no answer</strong>
+        (up to 3 attempts per person, by default).</li>
+      <li>Once someone is confirmed awake, <em>they</em> get the next name to call — the
+        relay keeps passing along until everyone's up or the end time passes.</li>
+      <li>If the Alay themselves never responds, the bot picks a backup automatically.</li>
+    </ol>
+  </section>
+
+  <section id="group-commands">
+    <h2>Group commands</h2>
+    <p class="muted">Typed directly in the group chat.</p>
+    <table>
+      <tr><th>Command</th><th>Who</th><th>What it does</th></tr>
+      <tr><td><code>/pd_setup</code></td><td><span class="badge admin">Admin</span></td>
+          <td>One-time setup for this group.</td></tr>
+      <tr><td><code>/pd_join</code></td><td>Anyone</td>
+          <td>Posts the Join button again.</td></tr>
+      <tr><td><code>/pd_rejoin</code></td><td><span class="badge admin">Admin</span></td>
+          <td>Posts a button asking everyone to re-open their DM with the bot
+              (use after an update or redeploy).</td></tr>
+      <tr><td><code>/pd_help</code></td><td>Anyone</td>
+          <td>Shows the full command list.</td></tr>
+    </table>
+    <p class="muted">The weekly Alay schedule is also posted here automatically.</p>
+  </section>
+
+  <section id="dm-commands">
+    <h2>Private (DM) commands</h2>
+    <p class="muted">Everything else happens by messaging the bot privately — send <code>/pd_menu</code> for tappable buttons, or type any of these directly.</p>
+    <table>
+      <tr><th>Command</th><th>What it does</th></tr>
+      <tr><td><code>/pd_menu</code></td><td>Opens a button menu (Schedule, Members, Status, Settings, Leave, and admin options).</td></tr>
+      <tr><td><code>/pd_schedule</code></td><td>Shows this week's (and, once ready, next week's) Alay schedule.</td></tr>
+      <tr><td><code>/pd_members</code></td><td>Lists everyone who has joined, and their status.</td></tr>
+      <tr><td><code>/pd_status</code></td><td>Shows what's happening right now — who's Alay, who's confirmed awake, who's still being called.</td></tr>
+      <tr><td><code>/pd_settings</code></td><td>Shows the group's current wake time, end time, timezone, and timing settings.</td></tr>
+      <tr><td><code>/pd_leave</code></td><td>Leaves the wake-up rotation. Rejoin any time with <code>/pd_join</code> in the group.</td></tr>
+    </table>
+  </section>
+
+  <section id="admin-commands">
+    <h2>Admin-only commands</h2>
+    <p class="muted">Also sent privately to the bot.</p>
+    <table>
+      <tr><th>Command</th><th>What it does</th></tr>
+      <tr><td><code>/pd_set wake HH:MM</code></td><td>Sets the daily wake time (24-hour, group-local time).</td></tr>
+      <tr><td><code>/pd_set end HH:MM</code></td><td>Sets the time the relay stops for the day.</td></tr>
+      <tr><td><code>/pd_set tz Area/City</code></td><td>Sets the group's timezone, e.g. <code>Asia/Manila</code>.</td></tr>
+      <tr><td><code>/pd_set alay_wait N</code></td><td>Minutes the Alay has to confirm before a backup takes over.</td></tr>
+      <tr><td><code>/pd_set attempt_wait N</code></td><td>Minutes a caller has to report back before an attempt is marked failed.</td></tr>
+      <tr><td><code>/pd_set attempts N</code></td><td>Max call attempts per person before someone else is assigned.</td></tr>
+      <tr><td><code>/pd_set nag N</code></td><td>Minutes between reminder bursts sent to the Alay.</td></tr>
+      <tr><td><code>/pd_set burst N</code></td><td>Number of reminder pings sent per burst.</td></tr>
+      <tr><td><code>/pd_regen</code></td><td>Reshuffles the remaining days of the current (or next) week's schedule.</td></tr>
+      <tr><td><code>/pd_start</code></td><td>Starts today's run immediately — handy for testing.</td></tr>
+      <tr><td><code>/pd_stop</code></td><td>Ends today's run right away.</td></tr>
+      <tr><td><code>/pd_pause</code></td><td>Turns the whole feature off for this group.</td></tr>
+      <tr><td><code>/pd_resume</code></td><td>Turns it back on.</td></tr>
+    </table>
+  </section>
+
+  <section id="settings">
+    <h2>Settings reference</h2>
+    <table>
+      <tr><th>Setting</th><th>Default</th><th>Meaning</th></tr>
+      <tr><td>wake</td><td>03:30</td><td>Time the Alay is first messaged.</td></tr>
+      <tr><td>end</td><td>04:30</td><td>Time the whole chain stops for the day.</td></tr>
+      <tr><td>tz</td><td>Asia/Manila</td><td>Timezone all times are interpreted in.</td></tr>
+      <tr><td>alay_wait</td><td>10 min</td><td>Grace period before the bot moves to a backup Alay.</td></tr>
+      <tr><td>attempt_wait</td><td>5 min</td><td>Time a caller has to report back on one attempt.</td></tr>
+      <tr><td>max_attempts</td><td>3</td><td>Attempts per person before someone else is assigned.</td></tr>
+      <tr><td>nag_min</td><td>2 min</td><td>Interval between reminder bursts to the Alay.</td></tr>
+      <tr><td>burst_count</td><td>10</td><td>Number of reminder pings per burst.</td></tr>
+    </table>
+  </section>
+
+  <section id="faq">
+    <h2>FAQ / troubleshooting</h2>
+
+    <h3>The bot won't DM me.</h3>
+    <p>Open a private chat with the bot and press <strong>Start</strong> at least once. If you've done this before but it stopped working (e.g. after an update), tap the button from <code>/pd_rejoin</code> in the group, or just send <code>/start</code> to the bot yourself.</p>
+
+    <h3>I'm in more than one group.</h3>
+    <p>Commands sent privately will ask you to pick which group they apply to.</p>
+
+    <h3>I missed my turn as Alay.</h3>
+    <p>You can still tap your original "I'm awake" button if you see it late — as long as the day's run hasn't finished. The bot will have moved on to a backup in the meantime.</p>
+
+    <h3>How is the daily Alay chosen?</h3>
+    <p>Whoever has served least recently gets priority, so the duty rotates fairly across the group over time.</p>
+
+    <h3>Can I skip a day?</h3>
+    <p>Ask an admin — skip dates are managed per member. If you need to step away entirely, use <code>/pd_leave</code> and rejoin later with <code>/pd_join</code>.</p>
+  </section>
+
+</div>
+
+<footer>
+  Predawn Wake-Up Bot — guide generated for the group's own reference.
+</footer>
+
+</body>
+</html>
