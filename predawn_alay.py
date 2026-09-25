@@ -1463,7 +1463,7 @@ MENU_ACTIONS = {
 # jsdelivr so it renders as a real web page (raw.githubusercontent.com serves .html
 # as plain text, which just shows the source instead of the page).
 # Update the username/repo/branch here if you move the file.
-GUIDE_URL = "https://cdn.jsdelivr.net/gh/<your-github-username>/Partakers@main/predawn_guide.html"
+GUIDE_URL = "https://Jervene17.github.io/Predawn-assist/predawn_guide.html"
 
 
 def _btn(label, action, cid):
