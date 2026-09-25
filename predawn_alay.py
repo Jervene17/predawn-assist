@@ -18,6 +18,9 @@ HOW IT WORKS
 * Admins can run /pd_rejoin in the group at any time (e.g. right after updating or
   redeploying the bot) to post a button asking everyone to re-open their DM with the
   bot, which re-registers them.
+* Every Saturday (end of the week) and on the last day of each month, the bot DMs the
+  group's admins an awards list: for each member, how many times they woke up on time
+  as Alay, and how many other people they successfully woke up during the chain.
 
 SETUP (standalone)
 ------------------
@@ -82,6 +85,7 @@ HEADERS = {
     "PA_Members": ["chat_id", "user_id", "name", "username", "active", "skip_dates"],
     "PA_Schedule": ["chat_id", "date", "user_id", "name", "status"],
     "PA_State": ["chat_id", "json"],
+    "PA_Awards": ["chat_id", "json"],
     "PA_Log": ["timestamp", "chat_id", "event", "user_id", "target_id", "detail"],
 }
 
@@ -162,6 +166,9 @@ class Store:
         self.members = []     # dicts: chat_id,user_id,name,username,active,skip(list of iso dates)
         self.schedule = []    # dicts: chat_id,date,user_id,name,status
         self.state = {}       # chat_id -> live run state (JSON-serialisable dict)
+        self.awards = {}      # chat_id -> {"week_woken": {uid_str: n}, "month_woken": {...},
+                              #             "last_week_sent": "YYYY-MM-DD" or None,
+                              #             "last_month_sent": "YYYY-MM" or None}
         self.dirty = set()
         self.log_rows = []
 
@@ -215,6 +222,11 @@ class Store:
                 self.state[int(r["chat_id"])] = json.loads(r["json"])
             except (ValueError, KeyError):
                 continue
+        for r in self._records("PA_Awards"):
+            try:
+                self.awards[int(r["chat_id"])] = json.loads(r["json"])
+            except (ValueError, KeyError):
+                continue
         self._worksheet("PA_Log")
         log.info("Predawn: loaded %d group(s), %d member(s)", len(self.groups), len(self.members))
 
@@ -232,6 +244,8 @@ class Store:
                     for r in self.schedule]
         if tab == "PA_State":
             return [[cid, json.dumps(st)] for cid, st in self.state.items()]
+        if tab == "PA_Awards":
+            return [[cid, json.dumps(aw)] for cid, aw in self.awards.items()]
         return []
 
     def snapshot(self):
@@ -750,11 +764,113 @@ async def advance(bot, cid, st):
             await fail_attempt(bot, cid, st, silent=True)
 
 
+# --------------------------------------------------------------------------------------
+# Weekly / monthly awards
+# --------------------------------------------------------------------------------------
+def get_award_state(cid):
+    if cid not in S.awards:
+        S.awards[cid] = {"week_woken": {}, "month_woken": {},
+                          "last_week_sent": None, "last_month_sent": None}
+    return S.awards[cid]
+
+
+def month_range(d):
+    """(first_day, last_day) of the calendar month containing d."""
+    first = d.replace(day=1)
+    next_first = date(d.year + 1, 1, 1) if d.month == 12 else date(d.year, d.month + 1, 1)
+    return first, next_first - timedelta(days=1)
+
+
+def served_counts(cid, date_from, date_to):
+    """How many times each member successfully woke up as Alay (any status='served'
+    schedule row) within [date_from, date_to] inclusive."""
+    counts = Counter()
+    names = {}
+    for r in S.schedule:
+        if r["chat_id"] != cid or r["status"] != "served":
+            continue
+        d = date.fromisoformat(r["date"])
+        if date_from <= d <= date_to:
+            counts[r["user_id"]] += 1
+            names[r["user_id"]] = r["name"]
+    return counts, names
+
+
+def fmt_awards(cid, title, date_from, date_to, woken_counts):
+    alay_counts, alay_names = served_counts(cid, date_from, date_to)
+    all_uids = set(alay_counts) | set(woken_counts)
+    if not all_uids:
+        return (f"{title}\n<i>{fmt_day(date_from)} - {fmt_day(date_to)}</i>\n\n"
+                f"No activity recorded for this period.")
+    rows = []
+    for uid in all_uids:
+        name = alay_names.get(uid) or name_of(cid, uid)
+        a = alay_counts.get(uid, 0)
+        w = woken_counts.get(uid, 0)
+        rows.append((name, a, w, a + w))
+    rows.sort(key=lambda r: (-r[3], -r[1], r[0].lower()))
+    medals = ["🥇", "🥈", "🥉"]
+    lines = [title, f"<i>{fmt_day(date_from)} - {fmt_day(date_to)}</i>", ""]
+    for i, (name, a, w, total) in enumerate(rows, 1):
+        rank = medals[i - 1] if i <= 3 else f"{i}."
+        lines.append(f"{rank} <b>{esc(name)}</b> - woke up as Alay: {a}, helped wake others: {w} "
+                     f"(score {total})")
+    return "\n".join(lines)
+
+
+async def send_to_admins(bot, cid, text):
+    try:
+        admins = await bot.get_chat_administrators(cid)
+    except TelegramError:
+        log.exception("Could not fetch admins for group %s", cid)
+        return
+    for a in admins:
+        if a.user.is_bot:
+            continue
+        await send_dm(bot, a.user.id, text)
+
+
+async def maybe_send_awards(bot, cid, g, now):
+    """Sends the weekly (Saturday) and/or monthly (last day of month) awards list to
+    the group's admins, once each period. Waits until the day's run has finished where
+    possible so the day's own results are included, but won't wait past 8pm local."""
+    today = now.date()
+    aw = get_award_state(cid)
+    st = S.state.get(cid)
+    run_done_today = bool(st and st["date"] == today.isoformat() and st["phase"] == "done")
+    ready = run_done_today or now.hour >= 20
+
+    if today.weekday() == 5 and ready:      # Saturday = end of the Mon-Sat week
+        monday = week_monday(today)
+        week_key = monday.isoformat()
+        if aw.get("last_week_sent") != week_key:
+            woken = {int(k): v for k, v in aw.get("week_woken", {}).items()}
+            text = fmt_awards(cid, "🏆 <b>Weekly Predawn Awards</b>", monday, today, woken)
+            await send_to_admins(bot, cid, text)
+            aw["week_woken"] = {}
+            aw["last_week_sent"] = week_key
+            S.dirty.add("PA_Awards")
+            S.add_log(cid, "weekly_award_sent", detail=week_key)
+
+    first, last = month_range(today)
+    if today == last and ready:
+        month_key = f"{today.year:04d}-{today.month:02d}"
+        if aw.get("last_month_sent") != month_key:
+            woken = {int(k): v for k, v in aw.get("month_woken", {}).items()}
+            text = fmt_awards(cid, "🏆 <b>Monthly Predawn Awards</b>", first, last, woken)
+            await send_to_admins(bot, cid, text)
+            aw["month_woken"] = {}
+            aw["last_month_sent"] = month_key
+            S.dirty.add("PA_Awards")
+            S.add_log(cid, "monthly_award_sent", detail=month_key)
+
+
 async def tick_group(bot, cid):
     g = S.groups[cid]
     now = now_local(g)
     today = now.date()
     await ensure_schedule(bot, cid, g, now)
+    await maybe_send_awards(bot, cid, g, now)
     st = S.state.get(cid)
     if st and st["phase"] != "done" and st["date"] != today.isoformat():
         st["phase"] = "done"          # left over from an earlier day (e.g. bot was down)
@@ -861,6 +977,12 @@ async def cb_result(update: Update, context: ContextTypes.DEFAULT_TYPE):
             st["cur"] = None
             S.dirty.add("PA_State")
             S.add_log(cid, "target_awake", q.from_user.id, target)
+            # Award tracking: credit the caller with successfully waking one more person.
+            aw = get_award_state(cid)
+            caller_key = str(q.from_user.id)
+            aw["week_woken"][caller_key] = aw["week_woken"].get(caller_key, 0) + 1
+            aw["month_woken"][caller_key] = aw["month_woken"].get(caller_key, 0) + 1
+            S.dirty.add("PA_Awards")
             try:
                 await q.edit_message_text(f"✅ {tname} is awake. Thank you!", parse_mode=ParseMode.HTML)
             except TelegramError:
@@ -1337,7 +1459,11 @@ MENU_ACTIONS = {
 }
 
 
-GUIDE_URL = "https://claude.ai/artifact/LedZSXUfVVwRUiBrCbZThg"
+# Link to the standalone HTML guide (predawn_guide.html in the repo), served via
+# jsdelivr so it renders as a real web page (raw.githubusercontent.com serves .html
+# as plain text, which just shows the source instead of the page).
+# Update the username/repo/branch here if you move the file.
+GUIDE_URL = "https://cdn.jsdelivr.net/gh/<your-github-username>/Partakers@main/predawn_guide.html"
 
 
 def _btn(label, action, cid):
