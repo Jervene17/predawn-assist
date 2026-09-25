@@ -66,7 +66,8 @@ DEFAULTS = {
     "alay_wait": 10,        # minutes the Alay has to tap "I'm awake" before a backup takes over
     "attempt_wait": 5,      # minutes a caller has to report back before an attempt counts as failed
     "max_attempts": 3,      # attempts per person before another person is assigned
-    "nag_min": 2,           # minutes between reminder DMs to the Alay
+    "nag_min": 2,           # minutes between reminder bursts to the Alay
+    "burst_count": 10,      # pings sent per reminder burst, ~1.2s apart
     "enabled": True,
 }
 
@@ -74,7 +75,7 @@ PRAY_TEXT = "Let's start our day with prayer"
 
 HEADERS = {
     "PA_Groups": ["chat_id", "title", "wake", "end", "tz", "alay_wait", "attempt_wait",
-                  "max_attempts", "nag_min", "enabled"],
+                  "max_attempts", "nag_min", "burst_count", "enabled"],
     "PA_Members": ["chat_id", "user_id", "name", "username", "active", "skip_dates"],
     "PA_Schedule": ["chat_id", "date", "user_id", "name", "status"],
     "PA_State": ["chat_id", "json"],
@@ -185,7 +186,7 @@ class Store:
             for k in ("wake", "end", "tz"):
                 if str(r.get(k, "")).strip():
                     g[k] = str(r[k]).strip()
-            for k in ("alay_wait", "attempt_wait", "max_attempts", "nag_min"):
+            for k in ("alay_wait", "attempt_wait", "max_attempts", "nag_min", "burst_count"):
                 if str(r.get(k, "")).strip():
                     g[k] = int(r[k])
             g["enabled"] = truthy(r.get("enabled", "1"))
@@ -217,7 +218,8 @@ class Store:
     def _rows(self, tab):
         if tab == "PA_Groups":
             return [[g["chat_id"], g["title"], g["wake"], g["end"], g["tz"], g["alay_wait"],
-                     g["attempt_wait"], g["max_attempts"], g["nag_min"], "1" if g["enabled"] else "0"]
+                     g["attempt_wait"], g["max_attempts"], g["nag_min"], g["burst_count"],
+                     "1" if g["enabled"] else "0"]
                     for g in self.groups.values()]
         if tab == "PA_Members":
             return [[m["chat_id"], m["user_id"], m["name"], m["username"],
@@ -519,6 +521,37 @@ async def dm_alay(bot, cid, st, m, nag=False):
     return msg is not None
 
 
+BURST_GAP_SECONDS = 1.2   # spacing between pings in a reminder burst - stays under Telegram's
+                          # per-chat flood limit while still landing as separate notifications
+
+
+async def run_alay_burst(bot, cid, day, uid):
+    """Sends a rapid-fire burst of reminder DMs to `uid` so their phone gets several
+    distinct notifications in a row instead of one easy-to-miss message. Runs as its own
+    background task (NOT holding the shared LOCK the whole time) so it can't stall the
+    rest of the bot for the ~10+ seconds a burst takes; it grabs the lock only briefly
+    for each individual send, and re-checks state before every ping so it stops
+    immediately if the run has moved on or the person has already confirmed awake."""
+    g = S.groups.get(cid)
+    if not g:
+        return
+    count = max(1, g.get("burst_count", DEFAULTS["burst_count"]))
+    for i in range(count):
+        async with LOCK:
+            st = S.state.get(cid)
+            if not st or st["date"] != day or st["phase"] != "alay_wait" or st["alay_id"] != uid:
+                return
+            if uid in {a["uid"] for a in st["awake"]}:
+                return
+            m = member(cid, uid)
+            if not m:
+                return
+            await dm_alay(bot, cid, st, m, nag=True)
+            S.dirty.add("PA_State")
+        if i < count - 1:
+            await asyncio.sleep(BURST_GAP_SECONDS)
+
+
 async def activate_alay(bot, cid, st, d, prev_name=None):
     """Pick the Alay (scheduled first, then a backup) and DM them. Loops if a DM can't be delivered.
     Once everyone in the pool has had an untaken turn, cycles back to the very first Alay assigned
@@ -698,9 +731,13 @@ async def advance(bot, cid, st):
             # late, so it needs to stay live.
             await activate_alay(bot, cid, st, d, prev_name=name_of(cid, prev))
         elif now >= from_iso(st["next_nag"]):
-            await dm_alay(bot, cid, st, member(cid, st["alay_id"]), nag=True)
             st["next_nag"] = in_minutes(g, g["nag_min"])
             S.dirty.add("PA_State")
+            # Fire the reminder burst in the background rather than awaiting it here -
+            # a burst can take 10+ seconds and advance() runs under the shared LOCK
+            # (via tick()), so awaiting it inline would stall every other group and
+            # every button press for that long.
+            asyncio.create_task(run_alay_burst(bot, cid, st["date"], st["alay_id"]))
     elif st["phase"] == "chain":
         if not unwoken(cid, st):
             await finish(bot, cid, st)
@@ -943,13 +980,11 @@ HELP_TEXT = (
     "DM me and send /pd_menu for buttons, or type any of these here:\n"
     "/pd_schedule - this week's Alay schedule\n"
     "/pd_members - who has joined\n"
-    "/pd_skip [date...] - skip today (or given YYYY-MM-DD dates)\n"
-    "/pd_unskip - clear your skips\n"
     "/pd_leave - leave the wake-up rotation\n"
     "/pd_status - what's happening now\n"
     "/pd_settings - show settings\n\n"
     "<b>Admins (also DM me for these)</b>\n"
-    "/pd_set wake|end HH:MM  |  tz Area/City  |  alay_wait|attempt_wait|attempts|nag N\n"
+    "/pd_set wake|end HH:MM  |  tz Area/City  |  alay_wait|attempt_wait|attempts|nag|burst N\n"
     "/pd_regen - reshuffle the remaining days\n"
     "/pd_start - start today's run now (testing)\n"
     "/pd_stop - end today's run\n"
@@ -1035,7 +1070,8 @@ def settings_text(g):
     return (f"<b>Predawn settings</b> - {esc(g['title'])}\n"
             f"Status: {'on' if g['enabled'] else 'paused'}\n"
             f"Wake time: {g['wake']}\nEnd time: {g['end']}\nTimezone: {g['tz']}\n"
-            f"Alay has {g['alay_wait']} min to respond (reminder every {g['nag_min']} min)\n"
+            f"Alay has {g['alay_wait']} min to respond - a burst of {g['burst_count']} pings "
+            f"every {g['nag_min']} min\n"
             f"Callers report within {g['attempt_wait']} min, {g['max_attempts']} attempts per person")
 
 
@@ -1065,7 +1101,8 @@ def apply_setting(g, key, value):
         g["tz"] = value
         return None
     fields = {"alay_wait": ("alay_wait", 1, 60), "attempt_wait": ("attempt_wait", 1, 30),
-              "attempts": ("max_attempts", 1, 10), "nag": ("nag_min", 1, 10)}
+              "attempts": ("max_attempts", 1, 10), "nag": ("nag_min", 1, 10),
+              "burst": ("burst_count", 1, 20)}
     if key in fields:
         field, lo, hi = fields[key]
         try:
@@ -1076,7 +1113,7 @@ def apply_setting(g, key, value):
             return f"Please choose a number from {lo} to {hi}."
         g[field] = n
         return None
-    return "Unknown setting. Use: wake, end, tz, alay_wait, attempt_wait, attempts, nag."
+    return "Unknown setting. Use: wake, end, tz, alay_wait, attempt_wait, attempts, nag, burst."
 
 
 async def cmd_set(update, context, forced_key=None):
@@ -1089,7 +1126,7 @@ async def cmd_set(update, context, forced_key=None):
     if len(args) < 2:
         await update.effective_message.reply_text(
             "Usage: /pd_set wake 03:30  |  end 04:30  |  tz Asia/Manila  |  alay_wait 10  |  "
-            "attempt_wait 5  |  attempts 3  |  nag 2")
+            "attempt_wait 5  |  attempts 3  |  nag 2  |  burst 10")
         return
     async with LOCK:
         err = apply_setting(S.groups[cid], args[0], args[1])
@@ -1167,48 +1204,6 @@ async def cmd_members(update, context):
     await update.effective_message.reply_text(
         f"<b>{len(ms)} member(s) joined</b> (only people who pressed Join appear here)\n" + "\n".join(lines),
         parse_mode=ParseMode.HTML)
-
-
-async def cmd_skip(update, context):
-    cid = await priv_ctx(update, context, action="skip")
-    if cid is None:
-        return
-    g = S.groups[cid]
-    async with LOCK:
-        m = member(cid, update.effective_user.id)
-        if not m:
-            await update.effective_message.reply_text("You haven't joined yet. Use /pd_join.")
-            return
-        today = now_local(g).date()
-        dates = []
-        for a in (context.args or ["today"]):
-            if a.lower() == "today":
-                dates.append(today)
-            elif a.lower() == "tomorrow":
-                dates.append(today + timedelta(days=1))
-            else:
-                try:
-                    dates.append(date.fromisoformat(a))
-                except ValueError:
-                    await update.effective_message.reply_text("Use dates like 2026-09-25, or 'today' / 'tomorrow'.")
-                    return
-        for d in dates:
-            if d.isoformat() not in m["skip"]:
-                m["skip"].append(d.isoformat())
-        S.dirty.add("PA_Members")
-    await update.effective_message.reply_text("👍 Skipping: " + ", ".join(fmt_day(d) for d in dates))
-
-
-async def cmd_unskip(update, context):
-    cid = await priv_ctx(update, context, action="unskip")
-    if cid is None:
-        return
-    async with LOCK:
-        m = member(cid, update.effective_user.id)
-        if m:
-            m["skip"] = []
-            S.dirty.add("PA_Members")
-    await update.effective_message.reply_text("👍 Your skips are cleared.")
 
 
 async def cmd_leave(update, context):
@@ -1298,11 +1293,14 @@ async def cmd_resume(update, context):
 MENU_ACTIONS = {
     "menu": None,  # filled in below, once cmd_menu exists
     "schedule": cmd_schedule, "members": cmd_members,
-    "skip": cmd_skip, "unskip": cmd_unskip, "leave": cmd_leave,
+    "leave": cmd_leave,
     "status": cmd_status, "settings": cmd_settings, "set": cmd_set,
     "regen": cmd_regen, "start": cmd_start_now,
     "stop": cmd_stop, "pause": cmd_pause, "resume": cmd_resume,
 }
+
+
+GUIDE_URL = "https://claude.ai/artifact/LedZSXUfVVwRUiBrCbZThg"
 
 
 def _btn(label, action, cid):
@@ -1315,7 +1313,6 @@ def build_menu(admin, cid):
     rows = [
         [_btn("📅 Schedule", "schedule", cid), _btn("👥 Members", "members", cid)],
         [_btn("📊 Status", "status", cid), _btn("⚙️ Settings", "settings", cid)],
-        [_btn("😴 Skip today", "skip", cid), _btn("🔁 Unskip", "unskip", cid)],
         [_btn("🚪 Leave", "leave", cid)],
     ]
     if admin:
@@ -1324,6 +1321,7 @@ def build_menu(admin, cid):
             [_btn("⏹ Stop", "stop", cid)],
             [_btn("⏸ Pause", "pause", cid), _btn("▶️ Resume", "resume", cid)],
         ]
+    rows.append([InlineKeyboardButton("📖 Guide to the bot", url=GUIDE_URL)])
     return InlineKeyboardMarkup(rows)
 
 
@@ -1407,7 +1405,7 @@ def register(application, spreadsheet, handle_plain_start=False, handler_group=-
         ("pd_setup", cmd_setup), ("pd_join", cmd_join), ("pd_help", cmd_help),
         ("pd_settings", cmd_settings), ("pd_set", cmd_set), ("pd_wake", cmd_setwake),
         ("pd_end", cmd_setend), ("pd_schedule", cmd_schedule), ("pd_regen", cmd_regen),
-        ("pd_members", cmd_members), ("pd_skip", cmd_skip), ("pd_unskip", cmd_unskip),
+        ("pd_members", cmd_members),
         ("pd_leave", cmd_leave), ("pd_status", cmd_status), ("pd_start", cmd_start_now),
         ("pd_stop", cmd_stop), ("pd_pause", cmd_pause), ("pd_resume", cmd_resume),
         ("pd_menu", cmd_menu),
