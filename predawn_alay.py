@@ -15,6 +15,9 @@ HOW IT WORKS
   until everyone is awake or the group's end time passes.
 * Everything is stored per chat_id, so one bot can serve many groups.
 * State is kept in Google Sheets tabs (PA_*), so a restart mid-morning recovers.
+* Admins can run /pd_rejoin in the group at any time (e.g. right after updating or
+  redeploying the bot) to post a button asking everyone to re-open their DM with the
+  bot, which re-registers them.
 
 SETUP (standalone)
 ------------------
@@ -886,8 +889,8 @@ async def is_admin(bot, cid, uid):
 
 
 async def group_only_ctx(update, context, admin=False, need_setup=True):
-    """Guard for the two commands that must still be typed inside the group itself
-    (/pd_setup and /pd_join). Returns chat_id or None (after replying)."""
+    """Guard for the commands that must still be typed inside the group itself
+    (/pd_setup, /pd_join, /pd_rejoin). Returns chat_id or None (after replying)."""
     chat = update.effective_chat
     if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
         await update.effective_message.reply_text("Please use this command inside your group.")
@@ -945,6 +948,16 @@ async def send_join_prompt(update, context, cid):
         parse_mode=ParseMode.HTML, reply_markup=kb)
 
 
+async def send_rejoin_prompt(update, context, cid):
+    """Posted by an admin (via /pd_rejoin) whenever members need to re-open their DM
+    with the bot - e.g. right after the bot code was updated or redeployed."""
+    url = f"https://t.me/{context.bot.username}?start=rejoin_{cid}"
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton(
+        "🔄 Join the next Predawn call relay", url=url)]])
+    await update.effective_message.reply_text(
+        "Please click to join the next predawn call relay", reply_markup=kb)
+
+
 async def cmd_setup(update, context):
     cid = await group_only_ctx(update, context, admin=True, need_setup=False)
     if cid is None:
@@ -971,10 +984,20 @@ async def cmd_join(update, context):
         await send_join_prompt(update, context, cid)
 
 
+async def cmd_rejoin(update, context):
+    """Admin-only, group-only. Run this after updating/redeploying the bot so members
+    re-open their DM with it and get re-registered."""
+    cid = await group_only_ctx(update, context, admin=True)
+    if cid is not None:
+        await send_rejoin_prompt(update, context, cid)
+
+
 HELP_TEXT = (
     "<b>In the group</b>\n"
     "/pd_setup - admin runs this once to set the group up\n"
     "/pd_join - posts the Join button\n"
+    "/pd_rejoin - admin: ask everyone to re-open their DM with the bot "
+    "(use after an update/redeploy)\n"
     "(the weekly Alay schedule also posts here automatically)\n\n"
     "<b>Everything else - message me privately</b>\n"
     "DM me and send /pd_menu for buttons, or type any of these here:\n"
@@ -996,17 +1019,35 @@ async def cmd_help(update, context):
     await update.effective_message.reply_text(HELP_TEXT, parse_mode=ParseMode.HTML)
 
 
+async def _register_member(cid, user):
+    """Add/refresh a member record. Caller must hold LOCK."""
+    full = " ".join(x for x in (user.first_name, user.last_name) if x)
+    m = member(cid, user.id)
+    if m:
+        m.update(name=full, username=user.username or "", active=True)
+    else:
+        S.members.append({"chat_id": cid, "user_id": user.id, "name": full,
+                          "username": user.username or "", "active": True, "skip": []})
+    S.dirty.add("PA_Members")
+    return full
+
+
 async def cmd_start(update, context):
     chat = update.effective_chat
     if chat.type != ChatType.PRIVATE:
         return
     args = context.args or []
-    if not (args and args[0].startswith("join_")):
+    arg = args[0] if args else ""
+    if arg.startswith("join_"):
+        rejoin, prefix_len = False, len("join_")
+    elif arg.startswith("rejoin_"):
+        rejoin, prefix_len = True, len("rejoin_")
+    else:
         if HANDLE_PLAIN_START:
             await show_start_menu(update, context)
         return
     try:
-        cid = int(args[0][5:])
+        cid = int(arg[prefix_len:])
     except ValueError:
         return
     user = update.effective_user
@@ -1022,21 +1063,17 @@ async def cmd_start(update, context):
             cm.status == ChatMemberStatus.RESTRICTED and not cm.is_member):
         await update.message.reply_text("You need to be a member of that group first.")
         raise ApplicationHandlerStop
-    full = " ".join(x for x in (user.first_name, user.last_name) if x)
     async with LOCK:
-        m = member(cid, user.id)
-        if m:
-            m.update(name=full, username=user.username or "", active=True)
-        else:
-            S.members.append({"chat_id": cid, "user_id": user.id, "name": full,
-                              "username": user.username or "", "active": True, "skip": []})
-        S.dirty.add("PA_Members")
-        S.add_log(cid, "member_joined", user.id)
+        full = await _register_member(cid, user)
+        S.add_log(cid, "member_rejoined" if rejoin else "member_joined", user.id)
     g = S.groups[cid]
-    await update.message.reply_text(
-        f"✅ You're in the Predawn wake-up for <b>{esc(g['title'])}</b>, {esc(user.first_name)}.\n"
-        f"Wake time: {g['wake']} (Mon-Sat). Please keep notifications on for this chat so I can wake you up "
-        f"when you're the Alay.", parse_mode=ParseMode.HTML)
+    if rejoin:
+        await update.message.reply_text("You are now registered for the predawn call relay")
+    else:
+        await update.message.reply_text(
+            f"✅ You're in the Predawn wake-up for <b>{esc(g['title'])}</b>, {esc(user.first_name)}.\n"
+            f"Wake time: {g['wake']} (Mon-Sat). Please keep notifications on for this chat so I can wake you up "
+            f"when you're the Alay.", parse_mode=ParseMode.HTML)
     admin = await is_admin(context.bot, cid, user.id)
     await update.message.reply_text(
         f"<b>Predawn wake-up menu</b> - {esc(g['title'])}\nTap a button below.",
@@ -1402,7 +1439,8 @@ def register(application, spreadsheet, handle_plain_start=False, handler_group=-
     add = lambda h: application.add_handler(h, group=handler_group)   # noqa: E731
     add(CommandHandler("start", cmd_start, filters=filters.ChatType.PRIVATE))
     for name, fn in [
-        ("pd_setup", cmd_setup), ("pd_join", cmd_join), ("pd_help", cmd_help),
+        ("pd_setup", cmd_setup), ("pd_join", cmd_join), ("pd_rejoin", cmd_rejoin),
+        ("pd_help", cmd_help),
         ("pd_settings", cmd_settings), ("pd_set", cmd_set), ("pd_wake", cmd_setwake),
         ("pd_end", cmd_setend), ("pd_schedule", cmd_schedule), ("pd_regen", cmd_regen),
         ("pd_members", cmd_members),
