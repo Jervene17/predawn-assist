@@ -8,15 +8,11 @@ HOW IT WORKS
 * Monday-Saturday the bot builds a weekly Alay schedule (one Alay per day). With more
   than 6 members it favours whoever served longest ago, so the rotation carries over
   from week to week.
-* At the group's wake time the bot DMs that day's Alay (plain reminder DMs only,
-  repeated as a burst) while the actual "I'm awake" button lives in the group's own
-  status message, so it never gets buried among the DM reminders. Once tapped, the
-  Alay is given a random name to call on Telegram. The Alay reports "awake" or
-  "no answer" (3 attempts per person). A person confirmed awake is then given the
-  next name to call, and so on, until everyone is awake. The end time is just a
-  target - if people are still unreached when it arrives, the relay keeps going
-  (with a one-time heads-up in the group) until everyone's confirmed or an admin
-  stops it with /pd_stop.
+* At the group's wake time the bot DMs that day's Alay. When the Alay taps
+  "I'm awake" the group is told, and the Alay is given a random name to call
+  on Telegram. The Alay reports "awake" or "no answer" (3 attempts per person).
+  A person confirmed awake is then given the next name to call, and so on,
+  until everyone is awake or the group's end time passes.
 * Everything is stored per chat_id, so one bot can serve many groups.
 * State is kept in Google Sheets tabs (PA_*), so a restart mid-morning recovers.
 * Admins can run /pd_rejoin in the group at any time (e.g. right after updating or
@@ -71,8 +67,10 @@ log = logging.getLogger("predawn")
 # --------------------------------------------------------------------------------------
 DEFAULTS = {
     "wake": "03:30",        # time the Alay is messaged (group-local time)
-    "end": "04:30",         # target finish time - a heads-up is posted if reached with
-                            # people still unreached, but the relay keeps going regardless
+    "end": "04:30",         # automatic runs start in [wake, end); also where "past end
+                            # time" warnings kick in for manual /pd_start
+    "deadline": "04:50",    # HARD stop for an in-progress relay - after this, the run
+                            # ends even if some people are still unreached
     "tz": os.environ.get("PREDAWN_TZ", "Asia/Manila"),
     "alay_wait": 10,        # minutes the Alay has to tap "I'm awake" before a backup takes over
     "attempt_wait": 5,      # minutes a caller has to report back before an attempt counts as failed
@@ -85,7 +83,7 @@ DEFAULTS = {
 PRAY_TEXT = "Let's start our day with prayer"
 
 HEADERS = {
-    "PA_Groups": ["chat_id", "title", "wake", "end", "tz", "alay_wait", "attempt_wait",
+    "PA_Groups": ["chat_id", "title", "wake", "end", "deadline", "tz", "alay_wait", "attempt_wait",
                   "max_attempts", "nag_min", "burst_count", "enabled"],
     "PA_Members": ["chat_id", "user_id", "name", "username", "active", "skip_dates"],
     "PA_Schedule": ["chat_id", "date", "user_id", "name", "status"],
@@ -198,7 +196,7 @@ class Store:
             g = dict(DEFAULTS)
             g["chat_id"] = int(r["chat_id"])
             g["title"] = r.get("title", "") or str(r["chat_id"])
-            for k in ("wake", "end", "tz"):
+            for k in ("wake", "end", "deadline", "tz"):
                 if str(r.get(k, "")).strip():
                     g[k] = str(r[k]).strip()
             for k in ("alay_wait", "attempt_wait", "max_attempts", "nag_min", "burst_count"):
@@ -237,9 +235,9 @@ class Store:
 
     def _rows(self, tab):
         if tab == "PA_Groups":
-            return [[g["chat_id"], g["title"], g["wake"], g["end"], g["tz"], g["alay_wait"],
-                     g["attempt_wait"], g["max_attempts"], g["nag_min"], g["burst_count"],
-                     "1" if g["enabled"] else "0"]
+            return [[g["chat_id"], g["title"], g["wake"], g["end"], g["deadline"], g["tz"],
+                     g["alay_wait"], g["attempt_wait"], g["max_attempts"], g["nag_min"],
+                     g["burst_count"], "1" if g["enabled"] else "0"]
                     for g in self.groups.values()]
         if tab == "PA_Members":
             return [[m["chat_id"], m["user_id"], m["name"], m["username"],
@@ -478,11 +476,16 @@ def unwoken(cid, st):
     return [m for m in pool(cid, date.fromisoformat(st["date"])) if m["user_id"] not in awake]
 
 
+def alay_button(cid, day):
+    return InlineKeyboardMarkup([[InlineKeyboardButton(
+        "✅ I'm awake", callback_data=f"pdaw:{cid}:{day}")]])
+
+
 def render_list(cid, st):
-    g = S.groups[cid]
     d = date.fromisoformat(st["date"])
     lines = [f"🌅 <b>Predawn wake-up</b> - {fmt_day(d)}",
              f"Alay: <b>{esc(name_of(cid, st['alay_id']))}</b>", ""]
+    g = S.groups[cid]
     if st["awake"]:
         lines.append("<b>Awake so far:</b>")
         for i, a in enumerate(st["awake"], 1):
@@ -490,17 +493,16 @@ def render_list(cid, st):
             lines.append(f"{i}. {esc(name_of(cid, a['uid']))} ✅ {t}")
     else:
         lines.append("Nobody has confirmed yet.")
-    if st["phase"] != "done":
-        lines += ["", "<i>Tap the button below once you're awake.</i>"]
     return "\n".join(lines)
 
 
 async def refresh_list(bot, cid, st):
     if not st.get("list_msg_id"):
         return
+    markup = None if st["phase"] == "done" else alay_button(cid, st["date"])
     try:
         await bot.edit_message_text(render_list(cid, st), chat_id=cid, message_id=st["list_msg_id"],
-                                    parse_mode=ParseMode.HTML)
+                                    parse_mode=ParseMode.HTML, reply_markup=markup)
     except TelegramError as e:
         if "not modified" not in str(e).lower():
             log.warning("Could not edit list message: %s", e)
@@ -508,18 +510,8 @@ async def refresh_list(bot, cid, st):
 
 def new_state(d):
     return {"date": d.isoformat(), "phase": "alay_wait", "alay_id": None, "alay_tried": [],
-            "alay_msgs": [], "alay_deadline": "", "next_nag": "", "awake": [], "list_msg_id": None,
-            "cur": None, "tried": {}, "stalled": [], "calls": {}, "pray": False,
-            "end_notice_sent": False}
-
-
-def alay_keyboard(cid, date_str):
-    """The one live "I'm awake" button for the day, posted in the group (not the DM)
-    so a burst of DM reminders can never bury it. Stays valid for anyone who has ever
-    been assigned Alay duty that day (see cb_alay), so a superseded Alay can still tap
-    it if they wake up late."""
-    return InlineKeyboardMarkup([[InlineKeyboardButton(
-        "✅ I'm awake", callback_data=f"pdaw:{cid}:{date_str}")]])
+            "alay_deadline": "", "next_nag": "", "awake": [], "list_msg_id": None,
+            "cur": None, "tried": {}, "stalled": [], "calls": {}, "pray": False}
 
 
 async def start_run(bot, cid):
@@ -531,15 +523,12 @@ async def start_run(bot, cid):
     S.add_log(cid, "run_started", detail=d.isoformat())
     if not await activate_alay(bot, cid, st, d):
         return
-    msg = await say(bot, cid, render_list(cid, st), markup=alay_keyboard(cid, st["date"]))
+    msg = await say(bot, cid, render_list(cid, st), markup=alay_button(cid, st["date"]))
     if msg:
         st["list_msg_id"] = msg.message_id
 
 
 async def dm_alay(bot, cid, st, m, nag=False):
-    """Plain-text DM only - no button here. The one clickable "I'm awake" button lives
-    in the group's status message (see alay_keyboard/start_run/refresh_list), so it
-    can't get lost among these reminder DMs."""
     g = S.groups[cid]
     if nag:
         text = (f"⏰ <b>{esc(m['name'])}</b>, still sleeping? You're today's Alay for "
@@ -548,8 +537,6 @@ async def dm_alay(bot, cid, st, m, nag=False):
         text = (f"🌅 <b>Good morning, {esc(m['name'])}!</b>\nYou're today's Alay for "
                 f"<b>{esc(g['title'])}</b>. Tap \"I'm awake\" in the group chat once you're up.")
     msg = await send_dm(bot, m["user_id"], text)
-    if msg:
-        st["alay_msgs"].append([m["user_id"], msg.message_id])
     return msg is not None
 
 
@@ -563,7 +550,9 @@ async def run_alay_burst(bot, cid, day, uid):
     background task (NOT holding the shared LOCK the whole time) so it can't stall the
     rest of the bot for the ~10+ seconds a burst takes; it grabs the lock only briefly
     for each individual send, and re-checks state before every ping so it stops
-    immediately if the run has moved on or the person has already confirmed awake."""
+    immediately if the run has moved on or the person has already confirmed awake.
+    These are plain reminder DMs with no button - the "I'm awake" button lives on the
+    single status message in the group, so it can't get buried among the burst."""
     g = S.groups.get(cid)
     if not g:
         return
@@ -579,7 +568,6 @@ async def run_alay_burst(bot, cid, day, uid):
             if not m:
                 return
             await dm_alay(bot, cid, st, m, nag=True)
-            S.dirty.add("PA_State")
         if i < count - 1:
             await asyncio.sleep(BURST_GAP_SECONDS)
 
@@ -587,8 +575,9 @@ async def run_alay_burst(bot, cid, day, uid):
 async def activate_alay(bot, cid, st, d, prev_name=None):
     """Pick the Alay (scheduled first, then a backup) and DM them. Loops if a DM can't be delivered.
     Once everyone in the pool has had an untaken turn, cycles back to the very first Alay assigned
-    today (if they still haven't confirmed) and keeps nagging them - there is no time limit;
-    see advance()'s end-time notice for the (non-stopping) heads-up posted in the group."""
+    today (if they still haven't confirmed) and keeps nagging them. There is no time limit on this
+    cycling other than everyone getting woken (see advance()) - it does not stop just because the
+    group's configured end time has passed."""
     g = S.groups[cid]
     while True:
         m, backup = choose_alay(cid, d, st["alay_tried"])
@@ -735,14 +724,13 @@ async def finish(bot, cid, st):
     S.add_log(cid, "run_finished", detail=f"awake={len(st['awake'])} remaining={len(rem)}")
     if st.get("alay_id"):
         await refresh_list(bot, cid, st)
-        await strip_kb(bot, cid, st.get("list_msg_id"))
     if not st["awake"]:
         text = "⏰ The Predawn wake-up has ended - nobody confirmed this morning."
     elif not rem:
         text = "🎉 Everyone is awake! Have a blessed Predawn."
     else:
-        text = (f"⏹ The wake-up relay has ended - {len(rem)} member(s) weren't reached. "
-                f"Please pray for them or call them personally 🙏")
+        text = ("⏰ Time's up. Not reached yet: " + ", ".join(esc(m["name"]) for m in rem)
+                + ".\nPlease pray for them or call them personally 🙏")
     await say(bot, cid, text)
 
 
@@ -750,11 +738,16 @@ async def advance(bot, cid, st):
     g = S.groups[cid]
     now = now_local(g)
     d = date.fromisoformat(st["date"])
-    if (not st.get("end_notice_sent") and now >= at_local(g, d, g["end"]) and unwoken(cid, st)):
-        st["end_notice_sent"] = True
-        S.dirty.add("PA_State")
-        await say(bot, cid, "⏰ We've reached the scheduled end time, but not everyone's "
-                            "awake yet - the relay continues until everyone's reached. 🙏")
+    if not unwoken(cid, st):
+        # Everyone's up - done, regardless of what time it is.
+        await finish(bot, cid, st)
+        return
+    if now >= at_local(g, d, g["deadline"]):
+        # Past the hard cutoff - stop even though some people are still unreached.
+        # (The regular "end" time is a softer marker: past end, the relay keeps
+        # extending in good faith; past deadline, it stops for good.)
+        await finish(bot, cid, st)
+        return
     if st["phase"] == "alay_wait":
         if now >= from_iso(st["alay_deadline"]):
             prev = st["alay_id"]
@@ -770,9 +763,7 @@ async def advance(bot, cid, st):
             # every button press for that long.
             asyncio.create_task(run_alay_burst(bot, cid, st["date"], st["alay_id"]))
     elif st["phase"] == "chain":
-        if not unwoken(cid, st):
-            await finish(bot, cid, st)
-        elif st.get("cur") is None:
+        if st.get("cur") is None:
             await next_pair(bot, cid, st)
         elif now >= from_iso(st["cur"]["deadline"]):
             await fail_attempt(bot, cid, st, silent=True)
@@ -927,7 +918,9 @@ async def cb_alay(update: Update, context: ContextTypes.DEFAULT_TYPE):
         uid = q.from_user.id
         # Anyone who was ever assigned Alay duty today can still confirm, even after
         # being superseded (e.g. they were asleep and only just saw the message) - as
-        # long as the run hasn't finished for the day.
+        # long as the run hasn't finished for the day. The button lives on the shared
+        # group status message, so it stays available to every eligible presser rather
+        # than one button per person.
         if not st or st["date"] != day or st["phase"] == "done" or uid not in st["alay_tried"]:
             await q.answer("This button is no longer active.")
             return
@@ -936,18 +929,13 @@ async def cb_alay(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         await q.answer("Thank you! 🌅")
         g = S.groups[cid]
-        d = date.fromisoformat(day)
         starting_now = st["phase"] == "alay_wait"
         st["awake"].append({"uid": uid, "ts": now_local(g).isoformat()})
-        set_row_status(cid, d, uid, "served")
+        set_row_status(cid, date.fromisoformat(day), uid, "served")
         if starting_now:
             st["phase"] = "chain"
         S.dirty.add("PA_State")
         S.add_log(cid, "alay_awake", uid)
-        # The tapped button lives on the group's shared status message (see
-        # alay_keyboard), not a per-person DM, so there's nothing to strip here - the
-        # refresh_list() call below updates that same message with the new awake list,
-        # and the toast from q.answer() above is the person's own confirmation.
         await refresh_list(context.bot, cid, st)
         if not st["pray"]:
             st["pray"] = True
@@ -1134,7 +1122,7 @@ HELP_TEXT = (
     "/pd_status - what's happening now\n"
     "/pd_settings - show settings\n\n"
     "<b>Admins (also DM me for these)</b>\n"
-    "/pd_set wake|end HH:MM  |  tz Area/City  |  alay_wait|attempt_wait|attempts|nag|burst N\n"
+    "/pd_set wake|end|deadline HH:MM  |  tz Area/City  |  alay_wait|attempt_wait|attempts|nag|burst N\n"
     "/pd_regen - reshuffle the remaining days\n"
     "/pd_start - start today's run now (testing)\n"
     "/pd_stop - end today's run\n"
@@ -1191,7 +1179,7 @@ async def cmd_start(update, context):
         await update.message.reply_text("You need to be a member of that group first.")
         raise ApplicationHandlerStop
     async with LOCK:
-        full = await _register_member(cid, user)
+        await _register_member(cid, user)
         S.add_log(cid, "member_rejoined" if rejoin else "member_joined", user.id)
     g = S.groups[cid]
     if rejoin:
@@ -1233,8 +1221,8 @@ async def show_start_menu(update, context):
 def settings_text(g):
     return (f"<b>Predawn settings</b> - {esc(g['title'])}\n"
             f"Status: {'on' if g['enabled'] else 'paused'}\n"
-            f"Wake time: {g['wake']}\nEnd time: {g['end']} (target - the relay keeps going "
-            f"past this if people are still unreached)\nTimezone: {g['tz']}\n"
+            f"Wake time: {g['wake']}\nEnd time: {g['end']}\nHard deadline: {g['deadline']}\n"
+            f"Timezone: {g['tz']}\n"
             f"Alay has {g['alay_wait']} min to respond - a burst of {g['burst_count']} pings "
             f"every {g['nag_min']} min\n"
             f"Callers report within {g['attempt_wait']} min, {g['max_attempts']} attempts per person")
@@ -1249,13 +1237,17 @@ async def cmd_settings(update, context):
 def apply_setting(g, key, value):
     """Returns None on success or an error string."""
     key = key.lower()
-    if key in ("wake", "end"):
+    if key in ("wake", "end", "deadline"):
         v = parse_hhmm(value)
         if not v:
             return "Please use 24-hour HH:MM, e.g. 03:30."
-        wake, end = (v, g["end"]) if key == "wake" else (g["wake"], v)
+        wake = v if key == "wake" else g["wake"]
+        end = v if key == "end" else g["end"]
+        deadline = v if key == "deadline" else g["deadline"]
         if minutes_of(end) <= minutes_of(wake):
             return "The end time must be later than the wake time (same morning)."
+        if minutes_of(deadline) < minutes_of(end):
+            return "The hard deadline must be at or after the end time (same morning)."
         g[key] = v
         return None
     if key == "tz":
@@ -1278,7 +1270,7 @@ def apply_setting(g, key, value):
             return f"Please choose a number from {lo} to {hi}."
         g[field] = n
         return None
-    return "Unknown setting. Use: wake, end, tz, alay_wait, attempt_wait, attempts, nag, burst."
+    return "Unknown setting. Use: wake, end, deadline, tz, alay_wait, attempt_wait, attempts, nag, burst."
 
 
 async def cmd_set(update, context, forced_key=None):
@@ -1290,8 +1282,8 @@ async def cmd_set(update, context, forced_key=None):
         args = [forced_key] + args
     if len(args) < 2:
         await update.effective_message.reply_text(
-            "Usage: /pd_set wake 03:30  |  end 04:30  |  tz Asia/Manila  |  alay_wait 10  |  "
-            "attempt_wait 5  |  attempts 3  |  nag 2  |  burst 10")
+            "Usage: /pd_set wake 03:30  |  end 04:30  |  deadline 04:50  |  tz Asia/Manila  |  "
+            "alay_wait 10  |  attempt_wait 5  |  attempts 3  |  nag 2  |  burst 10")
         return
     async with LOCK:
         err = apply_setting(S.groups[cid], args[0], args[1])
@@ -1414,6 +1406,10 @@ async def cmd_start_now(update, context):
         st = S.state.get(cid)
         if st and st["date"] == now_local(g).date().isoformat() and st["phase"] != "done":
             await update.effective_message.reply_text("A run is already in progress.")
+            return
+        if now_local(g) >= at_local(g, now_local(g).date(), g["end"]):
+            await update.effective_message.reply_text(
+                f"It's past today's end time ({g['end']}). Move it later with /pd_set end HH:MM first.")
             return
         await start_run(context.bot, cid)
 
