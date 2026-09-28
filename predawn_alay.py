@@ -8,11 +8,14 @@ HOW IT WORKS
 * Monday-Saturday the bot builds a weekly Alay schedule (one Alay per day). With more
   than 6 members it favours whoever served longest ago, so the rotation carries over
   from week to week.
-* At the group's wake time the bot DMs that day's Alay. When the Alay taps
-  "I'm awake" the group is told, and the Alay is given a random name to call
-  on Telegram. The Alay reports "awake" or "no answer" (3 attempts per person).
-  A person confirmed awake is then given the next name to call, and so on,
-  until everyone is awake or the group's end time passes.
+* At the group's wake time the bot DMs that day's Alay (with a burst of reminder pings)
+  and posts a message in the group with a single "I'm awake" button (nothing else - the
+  group isn't told who the Alay is or who's awake). Anyone who has joined can tap it as
+  soon as they wake up; the first person to do so - the Alay or whoever wakes next - is
+  given a random name to call on Telegram and reports "awake" or "no answer" (3 attempts
+  per person). A person confirmed awake is then given the next name to call, and so on,
+  until everyone is awake or the hard deadline passes. Afterwards the button is removed
+  and a summary of the run is DMed to the group's admins.
 * Everything is stored per chat_id, so one bot can serve many groups.
 * State is kept in Google Sheets tabs (PA_*), so a restart mid-morning recovers.
 * Admins can run /pd_rejoin in the group at any time (e.g. right after updating or
@@ -483,8 +486,11 @@ def alay_button(cid, day):
 
 def render_list(cid, st):
     d = date.fromisoformat(st["date"])
-    lines = [f"🌅 <b>Predawn wake-up</b> - {fmt_day(d)}",
-             f"Alay: <b>{esc(name_of(cid, st['alay_id']))}</b>", ""]
+    lines = []
+    if st.get("test"):
+        lines.append("🧪 <b>TEST RUN</b> (ignores wake/end/deadline times)")
+    lines += [f"🌅 <b>Predawn wake-up</b> - {fmt_day(d)}",
+              f"Alay: <b>{esc(name_of(cid, st['alay_id']))}</b>", ""]
     g = S.groups[cid]
     if st["awake"]:
         lines.append("<b>Awake so far:</b>")
@@ -496,34 +502,79 @@ def render_list(cid, st):
     return "\n".join(lines)
 
 
-async def refresh_list(bot, cid, st):
-    if not st.get("list_msg_id"):
+def button_text(st):
+    """The only thing posted in the group during a run: a short prompt with the button.
+    Deliberately doesn't name the current Alay or list who's awake."""
+    prefix = "🧪 <b>TEST RUN</b>\n" if st.get("test") else ""
+    return prefix + "🌅 <b>Predawn wake-up</b>\nTap the button as soon as you're awake."
+
+
+async def clear_group_button(bot, cid, st):
+    """Remove the button message from the group once the run is over."""
+    mid = st.get("list_msg_id")
+    if not mid:
         return
-    markup = None if st["phase"] == "done" else alay_button(cid, st["date"])
+    st["list_msg_id"] = None
     try:
-        await bot.edit_message_text(render_list(cid, st), chat_id=cid, message_id=st["list_msg_id"],
-                                    parse_mode=ParseMode.HTML, reply_markup=markup)
-    except TelegramError as e:
-        if "not modified" not in str(e).lower():
-            log.warning("Could not edit list message: %s", e)
+        await bot.delete_message(cid, mid)
+    except TelegramError:
+        await strip_kb(bot, cid, mid)     # couldn't delete - at least remove the button
 
 
-def new_state(d):
+def add_event(cid, st, text):
+    """Add a line to the run's timeline (shown in the admin summary, not the group)."""
+    g = S.groups[cid]
+    events = st.setdefault("events", [])
+    events.append(f"{now_local(g).strftime('%H:%M')} {text}")
+    del events[:-40]                      # keep the stored state small
+    S.dirty.add("PA_State")
+
+
+def build_summary(cid, st):
+    g = S.groups[cid]
+    d = date.fromisoformat(st["date"])
+    rem = unwoken(cid, st)
+    if not st["awake"]:
+        result = "⏰ Nobody confirmed."
+    elif not rem:
+        result = "🎉 Everyone was reached."
+    else:
+        result = f"⏰ {len(rem)} not reached."
+    tag = " (test run)" if st.get("test") else ""
+    lines = [f"📋 <b>Predawn run summary</b> - {esc(g['title'])}",
+             f"{fmt_day(d)}{tag}", "", result]
+    if st["awake"]:
+        lines += ["", "<b>Awake:</b>"]
+        alays = set(st["alay_tried"])
+        for i, a in enumerate(st["awake"], 1):
+            t = from_iso(a["ts"]).astimezone(tzinfo(g)).strftime("%H:%M")
+            label = " (Alay)" if a["uid"] in alays else ""
+            lines.append(f"{i}. {esc(name_of(cid, a['uid']))} - {t}{label}")
+    if rem:
+        lines += ["", "<b>Not reached:</b> " + ", ".join(esc(m["name"]) for m in rem)]
+    events = st.get("events", [])
+    if events:
+        lines += ["", "<b>Timeline:</b>"] + [esc(e) for e in events]
+    return "\n".join(lines)
+
+
+def new_state(d, test=False):
     return {"date": d.isoformat(), "phase": "alay_wait", "alay_id": None, "alay_tried": [],
             "alay_deadline": "", "next_nag": "", "awake": [], "list_msg_id": None,
-            "cur": None, "tried": {}, "stalled": [], "calls": {}, "pray": False}
+            "cur": None, "tried": {}, "stalled": [], "calls": {}, "pray": False, "test": test,
+            "events": []}
 
 
-async def start_run(bot, cid):
+async def start_run(bot, cid, test=False):
     g = S.groups[cid]
     d = now_local(g).date()
-    st = new_state(d)
+    st = new_state(d, test=test)
     S.state[cid] = st
     S.dirty.add("PA_State")
-    S.add_log(cid, "run_started", detail=d.isoformat())
+    S.add_log(cid, "test_run_started" if test else "run_started", detail=d.isoformat())
     if not await activate_alay(bot, cid, st, d):
         return
-    msg = await say(bot, cid, render_list(cid, st), markup=alay_button(cid, st["date"]))
+    msg = await say(bot, cid, button_text(st), markup=alay_button(cid, st["date"]))
     if msg:
         st["list_msg_id"] = msg.message_id
 
@@ -590,7 +641,7 @@ async def activate_alay(bot, cid, st, d, prev_name=None):
                 await finish(bot, cid, st)
                 return False
             m, backup, cycling_back = cand, False, True
-        if backup:
+        if backup and not st.get("test"):
             S.schedule.append({"chat_id": cid, "date": d.isoformat(), "user_id": m["user_id"],
                                "name": m["name"], "status": "backup"})
             S.dirty.add("PA_Schedule")
@@ -603,18 +654,16 @@ async def activate_alay(bot, cid, st, d, prev_name=None):
         S.dirty.add("PA_State")
         if await dm_alay(bot, cid, st, m):
             if prev_name and cycling_back:
-                await say(bot, cid, f"⚠️ {esc(prev_name)} didn't respond. Back to "
-                                    f"<b>{esc(m['name'])}</b> - still waiting on them.")
-                await refresh_list(bot, cid, st)
+                add_event(cid, st, f"{prev_name} didn't respond - back to {m['name']}, still waiting")
             elif prev_name:
-                await say(bot, cid, f"⚠️ {esc(prev_name)} didn't respond. "
-                                    f"<b>{esc(m['name'])}</b> is now the Alay.")
-                await refresh_list(bot, cid, st)
+                add_event(cid, st, f"{prev_name} didn't respond - {m['name']} is now the Alay")
+            else:
+                add_event(cid, st, f"{m['name']} pinged as Alay")
             return True
-        set_row_status(cid, d, m["user_id"], "missed")
+        if not st.get("test"):
+            set_row_status(cid, d, m["user_id"], "missed")
         S.add_log(cid, "alay_dm_failed", m["user_id"])
-        await say(bot, cid, f"⚠️ I couldn't message {esc(m['name'])} privately "
-                            f"(they may need to press Start on the bot). Trying someone else.")
+        add_event(cid, st, f"Couldn't DM {m['name']} (they may need to press Start on the bot) - trying someone else")
         prev_name = None
 
 
@@ -695,12 +744,13 @@ async def fail_attempt(bot, cid, st, silent):
 
     if silent and cur["silent"] >= g["max_attempts"]:
         st["stalled"].append(caller)
-        await say(bot, cid, f"⚠️ {esc(name_of(cid, caller))} isn't responding. "
-                            f"I'll hand the wake-up calls to someone else.")
+        add_event(cid, st, f"{name_of(cid, caller)} isn't responding - calls handed to someone else")
         await next_pair(bot, cid, st)
         return
     if cur["attempt"] >= g["max_attempts"]:
         st["tried"].setdefault(str(caller), []).append(target)
+        add_event(cid, st, f"{name_of(cid, caller)} tried {name_of(cid, target)} "
+                           f"{g['max_attempts']}x with no answer - moving on")
         note = (f"{g['max_attempts']} attempts used for {esc(name_of(cid, target))}. "
                 f"Here's someone else:")
         await next_pair(bot, cid, st, prefer=caller, note=note)
@@ -722,16 +772,10 @@ async def finish(bot, cid, st):
     S.dirty.add("PA_State")
     rem = unwoken(cid, st)
     S.add_log(cid, "run_finished", detail=f"awake={len(st['awake'])} remaining={len(rem)}")
-    if st.get("alay_id"):
-        await refresh_list(bot, cid, st)
-    if not st["awake"]:
-        text = "⏰ The Predawn wake-up has ended - nobody confirmed this morning."
-    elif not rem:
-        text = "🎉 Everyone is awake! Have a blessed Predawn."
-    else:
-        text = ("⏰ Time's up. Not reached yet: " + ", ".join(esc(m["name"]) for m in rem)
-                + ".\nPlease pray for them or call them personally 🙏")
-    await say(bot, cid, text)
+    # The group only ever sees the button during the relay - take it down, and send the
+    # recap to the group's admins privately instead of posting it in the group.
+    await clear_group_button(bot, cid, st)
+    await send_to_admins(bot, cid, build_summary(cid, st))
 
 
 async def advance(bot, cid, st):
@@ -742,16 +786,19 @@ async def advance(bot, cid, st):
         # Everyone's up - done, regardless of what time it is.
         await finish(bot, cid, st)
         return
-    if now >= at_local(g, d, g["deadline"]):
+    if not st.get("test") and now >= at_local(g, d, g["deadline"]):
         # Past the hard cutoff - stop even though some people are still unreached.
         # (The regular "end" time is a softer marker: past end, the relay keeps
-        # extending in good faith; past deadline, it stops for good.)
+        # extending in good faith; past deadline, it stops for good.) Test runs
+        # ignore this entirely, since they're deliberately started outside the
+        # normal wake/end/deadline window and shouldn't get killed by the clock.
         await finish(bot, cid, st)
         return
     if st["phase"] == "alay_wait":
         if now >= from_iso(st["alay_deadline"]):
             prev = st["alay_id"]
-            set_row_status(cid, d, prev, "missed")
+            if not st.get("test"):
+                set_row_status(cid, d, prev, "missed")
             S.add_log(cid, "alay_missed", prev)
             await activate_alay(bot, cid, st, d, prev_name=name_of(cid, prev))
         elif now >= from_iso(st["next_nag"]):
@@ -916,32 +963,43 @@ async def cb_alay(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with LOCK:
         st = S.state.get(cid)
         uid = q.from_user.id
-        # Anyone who was ever assigned Alay duty today can still confirm, even after
-        # being superseded (e.g. they were asleep and only just saw the message) - as
-        # long as the run hasn't finished for the day. The button lives on the shared
-        # group status message, so it stays available to every eligible presser rather
-        # than one button per person.
-        if not st or st["date"] != day or st["phase"] == "done" or uid not in st["alay_tried"]:
+        # Anyone who has joined the wake-up can tap this while the run is active - the
+        # scheduled Alay just gets the reminder pings, and whoever wakes up next taps the
+        # button and picks up the calling chain. The button lives on the single message
+        # in the group, so it stays available until the run ends.
+        if not st or st["date"] != day or st["phase"] == "done":
             await q.answer("This button is no longer active.")
+            return
+        m = member(cid, uid)
+        if not m or not m["active"]:
+            await q.answer("Please join the wake-up first (use the Join button), then tap this.")
             return
         if uid in {a["uid"] for a in st["awake"]}:
             await q.answer("You're already marked awake. Thank you!")
             return
         await q.answer("Thank you! 🌅")
         g = S.groups[cid]
+        d = date.fromisoformat(day)
         starting_now = st["phase"] == "alay_wait"
         st["awake"].append({"uid": uid, "ts": now_local(g).isoformat()})
-        set_row_status(cid, date.fromisoformat(day), uid, "served")
+        add_event(cid, st, f"{m['name']} tapped the awake button")
+        if not st.get("test"):
+            if starting_now and st["alay_id"] not in (None, uid):
+                # Someone else woke up before the Alay did - the Alay missed their turn.
+                set_row_status(cid, d, st["alay_id"], "missed")
+            set_row_status(cid, d, uid, "served")
         if starting_now:
             st["phase"] = "chain"
+        cur = st.get("cur")
+        if cur and cur["target"] == uid:
+            # They were just being called and woke up on their own - free up the caller.
+            await strip_kb(context.bot, cur["caller"], cur.get("msg_id"))
+            st["cur"] = None
         S.dirty.add("PA_State")
-        S.add_log(cid, "alay_awake", uid)
-        await refresh_list(context.bot, cid, st)
+        S.add_log(cid, "alay_awake" if uid in st["alay_tried"] else "self_awake", uid)
         if not st["pray"]:
             st["pray"] = True
-            await say(context.bot, cid, f"🙏 <b>{esc(name_of(cid, uid))}</b> is up! {PRAY_TEXT}.")
-        elif not starting_now:
-            await say(context.bot, cid, f"🙌 <b>{esc(name_of(cid, uid))}</b> just confirmed awake too.")
+            await say(context.bot, cid, f"🙏 {PRAY_TEXT}.")
         if starting_now or st.get("cur") is None:
             await next_pair(context.bot, cid, st, prefer=uid)
 
@@ -971,16 +1029,17 @@ async def cb_result(update: Update, context: ContextTypes.DEFAULT_TYPE):
             S.dirty.add("PA_State")
             S.add_log(cid, "target_awake", q.from_user.id, target)
             # Award tracking: credit the caller with successfully waking one more person.
-            aw = get_award_state(cid)
-            caller_key = str(q.from_user.id)
-            aw["week_woken"][caller_key] = aw["week_woken"].get(caller_key, 0) + 1
-            aw["month_woken"][caller_key] = aw["month_woken"].get(caller_key, 0) + 1
-            S.dirty.add("PA_Awards")
+            # Skipped for test runs so they don't skew the real weekly/monthly leaderboard.
+            if not st.get("test"):
+                aw = get_award_state(cid)
+                caller_key = str(q.from_user.id)
+                aw["week_woken"][caller_key] = aw["week_woken"].get(caller_key, 0) + 1
+                aw["month_woken"][caller_key] = aw["month_woken"].get(caller_key, 0) + 1
+                S.dirty.add("PA_Awards")
             try:
                 await q.edit_message_text(f"✅ {tname} is awake. Thank you!", parse_mode=ParseMode.HTML)
             except TelegramError:
                 pass
-            await refresh_list(context.bot, cid, st)
             await next_pair(context.bot, cid, st, prefer=target)
         else:
             await q.answer("Noted.")
@@ -1125,6 +1184,7 @@ HELP_TEXT = (
     "/pd_set wake|end|deadline HH:MM  |  tz Area/City  |  alay_wait|attempt_wait|attempts|nag|burst N\n"
     "/pd_regen - reshuffle the remaining days\n"
     "/pd_start - start today's run now (testing)\n"
+    "/pd_test - start a test run that ignores wake/end/deadline entirely\n"
     "/pd_stop - end today's run\n"
     "/pd_pause /pd_resume - switch the feature off/on"
 )
@@ -1409,9 +1469,26 @@ async def cmd_start_now(update, context):
             return
         if now_local(g) >= at_local(g, now_local(g).date(), g["end"]):
             await update.effective_message.reply_text(
-                f"It's past today's end time ({g['end']}). Move it later with /pd_set end HH:MM first.")
+                f"It's past today's end time ({g['end']}). Move it later with /pd_set end HH:MM first, "
+                f"or use /pd_test to try the flow without touching real settings.")
             return
         await start_run(context.bot, cid)
+
+
+async def cmd_test_run(update, context):
+    """Admin-only, works at any time of day. Unlike /pd_start, this never checks the
+    group's wake/end/deadline times - it always starts (or restarts) a run right away,
+    and that run ignores the hard deadline in advance() too, so the whole flow (Alay
+    DM, reminder burst, group button, calling chain) can be walked through and tested
+    outside the real early-morning window."""
+    cid = await priv_ctx(update, context, admin=True, action="test")
+    if cid is None:
+        return
+    async with LOCK:
+        await start_run(context.bot, cid, test=True)
+    await update.effective_message.reply_text(
+        "🧪 Test run started in the group - it ignores wake/end/deadline entirely, so take your "
+        "time. Use /pd_stop when you're done (or /pd_test again to restart it).")
 
 
 async def cmd_stop(update, context):
@@ -1421,6 +1498,7 @@ async def cmd_stop(update, context):
     async with LOCK:
         st = S.state.get(cid)
         if st and st["phase"] != "done":
+            add_event(cid, st, "Stopped by an admin")
             await finish(context.bot, cid, st)
         else:
             await update.effective_message.reply_text("Nothing is running.")
@@ -1452,7 +1530,7 @@ MENU_ACTIONS = {
     "schedule": cmd_schedule, "members": cmd_members,
     "leave": cmd_leave,
     "status": cmd_status, "settings": cmd_settings, "set": cmd_set,
-    "regen": cmd_regen, "start": cmd_start_now,
+    "regen": cmd_regen, "start": cmd_start_now, "test": cmd_test_run,
     "stop": cmd_stop, "pause": cmd_pause, "resume": cmd_resume,
 }
 
@@ -1479,7 +1557,7 @@ def build_menu(admin, cid):
     if admin:
         rows += [
             [_btn("🔀 Regen", "regen", cid), _btn("▶️ Start now", "start", cid)],
-            [_btn("⏹ Stop", "stop", cid)],
+            [_btn("🧪 Test run", "test", cid), _btn("⏹ Stop", "stop", cid)],
             [_btn("⏸ Pause", "pause", cid), _btn("▶️ Resume", "resume", cid)],
         ]
     rows.append([InlineKeyboardButton("📖 Guide to the bot", url=GUIDE_URL)])
@@ -1569,6 +1647,7 @@ def register(application, spreadsheet, handle_plain_start=False, handler_group=-
         ("pd_end", cmd_setend), ("pd_schedule", cmd_schedule), ("pd_regen", cmd_regen),
         ("pd_members", cmd_members),
         ("pd_leave", cmd_leave), ("pd_status", cmd_status), ("pd_start", cmd_start_now),
+        ("pd_test", cmd_test_run),
         ("pd_stop", cmd_stop), ("pd_pause", cmd_pause), ("pd_resume", cmd_resume),
         ("pd_menu", cmd_menu),
     ]:
