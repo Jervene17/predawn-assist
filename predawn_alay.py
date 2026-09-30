@@ -18,9 +18,9 @@ HOW IT WORKS
   and a summary of the run is DMed to the group's admins.
 * Everything is stored per chat_id, so one bot can serve many groups.
 * State is kept in Google Sheets tabs (PA_*), so a restart mid-morning recovers.
-* Admins can run /pd_rejoin in the group at any time (e.g. right after updating or
-  redeploying the bot) to post a button asking everyone to re-open their DM with the
-  bot, which re-registers them.
+* Admins can DM the bot /pd_rejoin at any time (e.g. right after updating or
+  redeploying the bot); it posts a button IN THE GROUP asking everyone to re-open their
+  DM with the bot, which re-registers them.
 * Every Saturday (end of the week) and on the last day of each month, the bot DMs the
   group's admins an awards list: for each member, how many times they woke up on time
   as Alay, and how many other people they successfully woke up during the chain.
@@ -721,7 +721,7 @@ async def next_pair(bot, cid, st, prefer=None, note=None):
             await finish(bot, cid, st)
             return
         caller, target = pair
-        st["cur"] = {"caller": caller, "target": target, "attempt": 1, "silent": 0,
+        st["cur"] = {"caller": caller, "target": target, "attempt": 1,
                      "deadline": in_minutes(g, g["attempt_wait"]), "msg_id": None}
         st["calls"][str(caller)] = st["calls"].get(str(caller), 0) + 1
         S.dirty.add("PA_State")
@@ -730,23 +730,25 @@ async def next_pair(bot, cid, st, prefer=None, note=None):
             return
         st["stalled"].append(caller)
         S.add_log(cid, "caller_dm_failed", caller)
+        add_event(cid, st, f"Couldn't message {name_of(cid, caller)} anymore - calls handed to someone else")
         prefer, note = None, None
 
 
 async def fail_attempt(bot, cid, st, silent):
+    """A caller's current attempt on their target didn't pan out - either they tapped
+    "No answer" (silent=False) or the attempt_wait deadline passed with no response from
+    the caller at all (silent=True). Both are treated the same way: once max_attempts is
+    hit, the SAME caller keeps their calling duty and simply gets a new target - a caller
+    never loses their duty just for being slow or quiet. The only things that move calling
+    duty to someone else are the bot genuinely failing to deliver a DM to them (see
+    next_pair), someone new waking up, or the relay ending."""
     g = S.groups[cid]
     cur = st["cur"]
     caller, target = cur["caller"], cur["target"]
     await strip_kb(bot, caller, cur.get("msg_id"))
-    cur["silent"] = cur["silent"] + 1 if silent else 0
     S.add_log(cid, "attempt_failed", caller, target, f"attempt {cur['attempt']} silent={silent}")
     S.dirty.add("PA_State")
 
-    if silent and cur["silent"] >= g["max_attempts"]:
-        st["stalled"].append(caller)
-        add_event(cid, st, f"{name_of(cid, caller)} isn't responding - calls handed to someone else")
-        await next_pair(bot, cid, st)
-        return
     if cur["attempt"] >= g["max_attempts"]:
         st["tried"].setdefault(str(caller), []).append(target)
         add_event(cid, st, f"{name_of(cid, caller)} tried {name_of(cid, target)} "
@@ -759,6 +761,7 @@ async def fail_attempt(bot, cid, st, silent):
     cur["deadline"] = in_minutes(g, g["attempt_wait"])
     if not await dm_caller(bot, cid, st, note="Let's try again."):
         st["stalled"].append(caller)
+        add_event(cid, st, f"Couldn't message {name_of(cid, caller)} anymore - calls handed to someone else")
         await next_pair(bot, cid, st)
 
 
@@ -1064,7 +1067,7 @@ async def is_admin(bot, cid, uid):
 
 async def group_only_ctx(update, context, admin=False, need_setup=True):
     """Guard for the commands that must still be typed inside the group itself
-    (/pd_setup, /pd_join, /pd_rejoin). Returns chat_id or None (after replying)."""
+    (/pd_setup, /pd_join). Returns chat_id or None (after replying)."""
     chat = update.effective_chat
     if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
         await update.effective_message.reply_text("Please use this command inside your group.")
@@ -1122,14 +1125,15 @@ async def send_join_prompt(update, context, cid):
         parse_mode=ParseMode.HTML, reply_markup=kb)
 
 
-async def send_rejoin_prompt(update, context, cid):
-    """Posted by an admin (via /pd_rejoin) whenever members need to re-open their DM
-    with the bot - e.g. right after the bot code was updated or redeployed."""
-    url = f"https://t.me/{context.bot.username}?start=rejoin_{cid}"
+async def send_rejoin_prompt(bot, cid):
+    """Posts the rejoin button IN THE GROUP - triggered by an admin's /pd_rejoin, which
+    is now a DM command, but the button itself still needs to appear where the members
+    actually are. Used whenever members need to re-open their DM with the bot, e.g.
+    right after the bot code was updated or redeployed."""
+    url = f"https://t.me/{bot.username}?start=rejoin_{cid}"
     kb = InlineKeyboardMarkup([[InlineKeyboardButton(
         "🔄 Join the next Predawn call relay", url=url)]])
-    await update.effective_message.reply_text(
-        "Please click to join the next predawn call relay", reply_markup=kb)
+    await say(bot, cid, "Please click to join the next predawn call relay", markup=kb)
 
 
 async def cmd_setup(update, context):
@@ -1159,19 +1163,21 @@ async def cmd_join(update, context):
 
 
 async def cmd_rejoin(update, context):
-    """Admin-only, group-only. Run this after updating/redeploying the bot so members
-    re-open their DM with it and get re-registered."""
-    cid = await group_only_ctx(update, context, admin=True)
-    if cid is not None:
-        await send_rejoin_prompt(update, context, cid)
+    """Admin-only, run by DM (not in the group). Posts the actual rejoin button in the
+    group itself, for members to tap - this just triggers it. Use after
+    updating/redeploying the bot so members re-open their DM with it and get
+    re-registered."""
+    cid = await priv_ctx(update, context, admin=True, action="rejoin")
+    if cid is None:
+        return
+    await send_rejoin_prompt(context.bot, cid)
+    await update.effective_message.reply_text("Posted the rejoin button in the group.")
 
 
 HELP_TEXT = (
     "<b>In the group</b>\n"
     "/pd_setup - admin runs this once to set the group up\n"
     "/pd_join - posts the Join button\n"
-    "/pd_rejoin - admin: ask everyone to re-open their DM with the bot "
-    "(use after an update/redeploy)\n"
     "(the weekly Alay schedule also posts here automatically)\n\n"
     "<b>Everything else - message me privately</b>\n"
     "DM me and send /pd_menu for buttons, or type any of these here:\n"
@@ -1185,6 +1191,8 @@ HELP_TEXT = (
     "/pd_regen - reshuffle the remaining days\n"
     "/pd_start - start today's run now (testing)\n"
     "/pd_test - start a test run that ignores wake/end/deadline entirely\n"
+    "/pd_rejoin - post a button in the group asking everyone to re-open their DM "
+    "(use after an update/redeploy)\n"
     "/pd_stop - end today's run\n"
     "/pd_pause /pd_resume - switch the feature off/on"
 )
@@ -1531,7 +1539,7 @@ MENU_ACTIONS = {
     "leave": cmd_leave,
     "status": cmd_status, "settings": cmd_settings, "set": cmd_set,
     "regen": cmd_regen, "start": cmd_start_now, "test": cmd_test_run,
-    "stop": cmd_stop, "pause": cmd_pause, "resume": cmd_resume,
+    "stop": cmd_stop, "pause": cmd_pause, "resume": cmd_resume, "rejoin": cmd_rejoin,
 }
 
 
@@ -1559,6 +1567,7 @@ def build_menu(admin, cid):
             [_btn("🔀 Regen", "regen", cid), _btn("▶️ Start now", "start", cid)],
             [_btn("🧪 Test run", "test", cid), _btn("⏹ Stop", "stop", cid)],
             [_btn("⏸ Pause", "pause", cid), _btn("▶️ Resume", "resume", cid)],
+            [_btn("🔄 Rejoin", "rejoin", cid)],
         ]
     rows.append([InlineKeyboardButton("📖 Guide to the bot", url=GUIDE_URL)])
     return InlineKeyboardMarkup(rows)
@@ -1641,13 +1650,13 @@ def register(application, spreadsheet, handle_plain_start=False, handler_group=-
     add = lambda h: application.add_handler(h, group=handler_group)   # noqa: E731
     add(CommandHandler("start", cmd_start, filters=filters.ChatType.PRIVATE))
     for name, fn in [
-        ("pd_setup", cmd_setup), ("pd_join", cmd_join), ("pd_rejoin", cmd_rejoin),
+        ("pd_setup", cmd_setup), ("pd_join", cmd_join),
         ("pd_help", cmd_help),
         ("pd_settings", cmd_settings), ("pd_set", cmd_set), ("pd_wake", cmd_setwake),
         ("pd_end", cmd_setend), ("pd_schedule", cmd_schedule), ("pd_regen", cmd_regen),
         ("pd_members", cmd_members),
         ("pd_leave", cmd_leave), ("pd_status", cmd_status), ("pd_start", cmd_start_now),
-        ("pd_test", cmd_test_run),
+        ("pd_test", cmd_test_run), ("pd_rejoin", cmd_rejoin),
         ("pd_stop", cmd_stop), ("pd_pause", cmd_pause), ("pd_resume", cmd_resume),
         ("pd_menu", cmd_menu),
     ]:
