@@ -61,6 +61,7 @@ from telegram.ext import (
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
+    MessageHandler,
     filters,
 )
 
@@ -1299,6 +1300,8 @@ HELP_TEXT = (
     "/pd_status - what's happening now\n"
     "/pd_settings - show settings\n\n"
     "<b>Admins (also DM me for these)</b>\n"
+    "Open /start and tap 🙏 Set prayer message to paste a prayer or sermon excerpt.\n"
+    "/cancel - cancel a pending prayer message change\n"
     "/pd_set wake|end|deadline HH:MM  |  tz Area/City  |  alay_wait|attempt_wait|attempts|nag|burst N\n"
     "/pd_set pray TEXT - change the group's Let's pray message\n"
     "/pd_regen - reshuffle the remaining days\n"
@@ -1414,6 +1417,49 @@ async def cmd_settings(update, context):
     cid = await priv_ctx(update, context, action="settings")
     if cid is not None:
         await update.effective_message.reply_text(settings_text(S.groups[cid]), parse_mode=ParseMode.HTML)
+
+
+async def cmd_pray_prompt(update, context):
+    cid = getattr(context, "_pd_forced_cid", None)
+    uid = update.effective_user.id
+    if cid not in S.groups or not await is_admin(context.bot, cid, uid):
+        await update.effective_message.reply_text("Only a group admin can change this message.")
+        return
+    context.user_data["pd_pray_cid"] = cid
+    await update.effective_message.reply_text(
+        f"Send the new Let's pray message for {S.groups[cid]['title']} in your next message. "
+        "You can paste a sermon excerpt (up to 3,500 characters). Send /cancel to stop.")
+
+
+async def cmd_cancel_pray(update, context):
+    if update.effective_chat.type != ChatType.PRIVATE:
+        return
+    if context.user_data.pop("pd_pray_cid", None) is not None:
+        await update.effective_message.reply_text("Prayer message change cancelled.")
+
+
+async def receive_pray_message(update, context):
+    cid = context.user_data.get("pd_pray_cid")
+    if cid is None:
+        return
+    if cid not in S.groups or not await is_admin(context.bot, cid, update.effective_user.id):
+        context.user_data.pop("pd_pray_cid", None)
+        await update.effective_message.reply_text("Only a group admin can change this message. Open /start again if needed.")
+        return
+    text = (update.effective_message.text or "").strip()
+    if not text:
+        await update.effective_message.reply_text("Please send some text, or /cancel to stop.")
+        return
+    if len(text) > 3500:
+        await update.effective_message.reply_text("That is over 3,500 characters. Please send a shorter message, or /cancel.")
+        return
+    async with LOCK:
+        S.groups[cid]["pray_text"] = text
+        S.dirty.add("PA_Groups")
+    context.user_data.pop("pd_pray_cid", None)
+    await update.effective_message.reply_text(
+        f"✅ Updated the Let's pray message for {S.groups[cid]['title']}.",
+        reply_markup=build_menu(True, cid))
 
 
 def apply_setting(g, key, value):
@@ -1663,7 +1709,7 @@ MENU_ACTIONS = {
     "menu": None,  # filled in below, once cmd_menu exists
     "schedule": cmd_schedule, "members": cmd_members,
     "leave": cmd_leave,
-    "status": cmd_status, "settings": cmd_settings, "set": cmd_set,
+    "status": cmd_status, "settings": cmd_settings, "set": cmd_set, "pray": cmd_pray_prompt,
     "regen": cmd_regen, "start": cmd_start_now, "test": cmd_test_run,
     "stop": cmd_stop, "pause": cmd_pause, "resume": cmd_resume, "rejoin": cmd_rejoin,
 }
@@ -1692,6 +1738,7 @@ def build_menu(admin, cid):
         rows += [
             [_btn("🔀 Regen", "regen", cid), _btn("▶️ Start now", "start", cid)],
             [_btn("🧪 Test run", "test", cid), _btn("⏹ Stop", "stop", cid)],
+            [_btn("🙏 Set prayer message", "pray", cid)],
             [_btn("⏸ Pause", "pause", cid), _btn("▶️ Resume", "resume", cid)],
             [_btn("🔄 Rejoin", "rejoin", cid)],
         ]
@@ -1782,6 +1829,7 @@ def register(application, spreadsheet, handle_plain_start=False, handler_group=-
         ("pd_end", cmd_setend), ("pd_schedule", cmd_schedule), ("pd_regen", cmd_regen),
         ("pd_members", cmd_members),
         ("pd_leave", cmd_leave), ("pd_status", cmd_status), ("pd_start", cmd_start_now),
+        ("cancel", cmd_cancel_pray),
         ("pd_test", cmd_test_run), ("pd_rejoin", cmd_rejoin),
         ("pd_stop", cmd_stop), ("pd_pause", cmd_pause), ("pd_resume", cmd_resume),
         ("pd_menu", cmd_menu),
@@ -1790,6 +1838,7 @@ def register(application, spreadsheet, handle_plain_start=False, handler_group=-
     add(CallbackQueryHandler(cb_alay, pattern=r"^pdaw:"))
     add(CallbackQueryHandler(cb_result, pattern=r"^pd(ok|no):"))
     add(CallbackQueryHandler(cb_dispatch, pattern=r"^pdm:"))
+    add(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, receive_pray_message))
     application.job_queue.run_repeating(tick, interval=30, first=10, name="predawn_tick")
     application.job_queue.run_repeating(flush_job, interval=20, first=20, name="predawn_flush")
 
