@@ -5,10 +5,11 @@ HOW IT WORKS
 ------------
 * Each group runs /pd_setup once. The bot posts a "Join" button; every member taps
   it and presses Start in a private chat with the bot (needed so the bot can DM).
-* Monday-Saturday the bot builds a weekly Alay schedule (one Alay per day). With more
+* Monday-Saturday the bot builds a weekly Alay schedule (one scheduled Alay per day).
+  Groups with more than five active members receive two Alay messages at a time. With more
   than 6 members it favours whoever served longest ago, so the rotation carries over
   from week to week.
-* At the group's wake time the bot DMs that day's Alay (with a burst of reminder pings)
+* At the group's wake time the bot DMs that day's Alay or Alays (with bursts of reminder pings)
   and posts a message in the group with a single "I'm awake" button (nothing else - the
   group isn't told who the Alay is or who's awake). Anyone who has joined can tap it as
   soon as they wake up; the first person to do so - the Alay or whoever wakes next - is
@@ -80,6 +81,7 @@ DEFAULTS = {
     "max_attempts": 3,      # attempts per person before another person is assigned
     "nag_min": 2,           # minutes between reminder bursts to the Alay
     "burst_count": 10,      # pings sent per reminder burst, ~1.2s apart
+    "pray_text": "Let's start our day with prayer",
     "enabled": True,
 }
 
@@ -87,7 +89,7 @@ PRAY_TEXT = "Let's start our day with prayer"
 
 HEADERS = {
     "PA_Groups": ["chat_id", "title", "wake", "end", "deadline", "tz", "alay_wait", "attempt_wait",
-                  "max_attempts", "nag_min", "burst_count", "enabled"],
+                  "max_attempts", "nag_min", "burst_count", "enabled", "pray_text"],
     "PA_Members": ["chat_id", "user_id", "name", "username", "active", "skip_dates"],
     "PA_Schedule": ["chat_id", "date", "user_id", "name", "status"],
     "PA_State": ["chat_id", "json"],
@@ -206,6 +208,7 @@ class Store:
                 if str(r.get(k, "")).strip():
                     g[k] = int(r[k])
             g["enabled"] = truthy(r.get("enabled", "1"))
+            g["pray_text"] = str(r.get("pray_text", "")).strip() or PRAY_TEXT
             self.groups[g["chat_id"]] = g
         for r in self._records("PA_Members"):
             if not str(r.get("user_id", "")).strip():
@@ -240,7 +243,7 @@ class Store:
         if tab == "PA_Groups":
             return [[g["chat_id"], g["title"], g["wake"], g["end"], g["deadline"], g["tz"],
                      g["alay_wait"], g["attempt_wait"], g["max_attempts"], g["nag_min"],
-                     g["burst_count"], "1" if g["enabled"] else "0"]
+                     g["burst_count"], "1" if g["enabled"] else "0", g.get("pray_text", PRAY_TEXT)]
                     for g in self.groups.values()]
         if tab == "PA_Members":
             return [[m["chat_id"], m["user_id"], m["name"], m["username"],
@@ -500,8 +503,10 @@ def render_list(cid, st):
     lines = []
     if st.get("test"):
         lines.append("🧪 <b>TEST RUN</b> (ignores wake/end/deadline times)")
+    alays = st.get("alay_ids") or ([st["alay_id"]] if st.get("alay_id") else [])
+    alay_names = ", ".join(esc(name_of(cid, uid)) for uid in alays) or "-"
     lines += [f"🌅 <b>Predawn wake-up</b> - {fmt_day(d)}",
-              f"Alay: <b>{esc(name_of(cid, st['alay_id']))}</b>", ""]
+              f"Alay: <b>{alay_names}</b>", ""]
     g = S.groups[cid]
     if st["awake"]:
         lines.append("<b>Awake so far:</b>")
@@ -570,10 +575,34 @@ def build_summary(cid, st):
 
 
 def new_state(d, test=False):
-    return {"date": d.isoformat(), "phase": "alay_wait", "alay_id": None, "alay_tried": [],
+    return {"date": d.isoformat(), "phase": "alay_wait", "alay_id": None, "alay_ids": [], "alay_tried": [],
             "alay_deadline": "", "next_nag": "", "awake": [], "list_msg_id": None,
-            "cur": None, "tried": {}, "stalled": [], "calls": {}, "pray": False, "test": test,
+            "cur": None, "curs": [], "tried": {}, "stalled": [], "calls": {}, "pray": False, "test": test,
             "events": []}
+
+
+def active_calls(st):
+    """Read current assignments, including single-call states saved by older versions."""
+    calls = st.get("curs")
+    if calls is not None:
+        return calls
+    cur = st.get("cur")
+    return [cur] if cur else []
+
+
+def set_active_calls(st, calls):
+    st["curs"] = calls
+    st["cur"] = calls[0] if calls else None
+
+
+def remove_active_call(st, cur):
+    calls = active_calls(st)
+    calls[:] = [c for c in calls if c is not cur]
+    set_active_calls(st, calls)
+
+
+def parallel_limit(cid, st):
+    return 2 if len(pool(cid, date.fromisoformat(st["date"]))) > 5 else 1
 
 
 async def start_run(bot, cid, test=False):
@@ -644,7 +673,7 @@ async def run_alay_burst(bot, cid, day, uid):
     for i in range(count):
         async with LOCK:
             st = S.state.get(cid)
-            if not st or st["date"] != day or st["phase"] != "alay_wait" or st["alay_id"] != uid:
+            if not st or st["date"] != day or st["phase"] != "alay_wait" or uid not in (st.get("alay_ids") or [st.get("alay_id")]):
                 return
             if uid in {a["uid"] for a in st["awake"]}:
                 return
@@ -657,57 +686,86 @@ async def run_alay_burst(bot, cid, day, uid):
 
 
 async def activate_alay(bot, cid, st, d, prev_name=None):
-    """Pick the Alay (scheduled first, then a backup) and DM them. Loops if a DM can't be delivered.
-    Once everyone in the pool has had an untaken turn, cycles back to the very first Alay assigned
-    today (if they still haven't confirmed) and keeps nagging them. There is no time limit on this
-    cycling other than everyone getting woken (see advance()) - it does not stop just because the
-    group's configured end time has passed."""
+    """DM the scheduled Alay and one backup alongside them in groups over five."""
     g = S.groups[cid]
-    while True:
+    wanted = 2 if len(pool(cid, d)) > 5 else 1
+    previous_ids = list(st.get("alay_ids") or ([st["alay_id"]] if st.get("alay_id") else []))
+    chosen, awake = [], {a["uid"] for a in st["awake"]}
+    while len(chosen) < wanted:
         m, backup = choose_alay(cid, d, st["alay_tried"])
-        cycling_back = False
+        cycling = False
         if not m:
-            first_uid = st["alay_tried"][0] if st["alay_tried"] else None
-            cand = member(cid, first_uid) if first_uid else None
-            already_awake = first_uid in {a["uid"] for a in st["awake"]} if first_uid else True
-            if not cand or not cand["active"] or is_skipping(cand, d) or already_awake:
-                await finish(bot, cid, st)
-                return False
-            m, backup, cycling_back = cand, False, True
-        if backup and not st.get("test"):
+            m = next((member(cid, uid) for uid in previous_ids
+                      if uid not in awake and uid not in {x["user_id"] for x in chosen}
+                      and member(cid, uid) and member(cid, uid)["active"]
+                      and not is_skipping(member(cid, uid), d)), None)
+            backup, cycling = False, bool(m)
+        if not m:
+            break
+        if not st.get("test") and backup:
             S.schedule.append({"chat_id": cid, "date": d.isoformat(), "user_id": m["user_id"],
                                "name": m["name"], "status": "backup"})
             S.dirty.add("PA_Schedule")
-        st["alay_id"] = m["user_id"]
         if m["user_id"] not in st["alay_tried"]:
             st["alay_tried"].append(m["user_id"])
-        st["phase"] = "alay_wait"
-        st["alay_deadline"] = in_minutes(g, g["alay_wait"])
-        st["next_nag"] = in_minutes(g, g["nag_min"])
-        S.dirty.add("PA_State")
+        chosen.append((m, cycling))
+
+    if not chosen:
+        await finish(bot, cid, st)
+        return False
+    st["alay_ids"] = [m["user_id"] for m, _ in chosen]
+    st["alay_id"] = st["alay_ids"][0]  # legacy field for saved states and integrations
+    st["phase"] = "alay_wait"
+    st["alay_deadline"] = in_minutes(g, g["alay_wait"])
+    st["next_nag"] = in_minutes(g, g["nag_min"])
+    S.dirty.add("PA_State")
+
+    sent = []
+    pending = list(chosen)
+    while len(sent) < wanted:
+        if not pending:
+            m, backup = choose_alay(cid, d, st["alay_tried"])
+            if not m:
+                break
+            if not st.get("test") and backup:
+                S.schedule.append({"chat_id": cid, "date": d.isoformat(), "user_id": m["user_id"],
+                                   "name": m["name"], "status": "backup"})
+                S.dirty.add("PA_Schedule")
+            st["alay_tried"].append(m["user_id"])
+            pending.append((m, False))
+        m, cycling = pending.pop(0)
         if await dm_alay(bot, cid, st, m):
-            if prev_name and cycling_back:
-                add_event(cid, st, f"{prev_name} didn't respond - back to {m['name']}, still waiting")
-            elif prev_name:
-                add_event(cid, st, f"{prev_name} didn't respond - {m['name']} is now the Alay")
+            sent.append(m["user_id"])
+            if prev_name:
+                add_event(cid, st, f"{prev_name} didn't respond - {m['name']} is now an Alay")
             else:
                 add_event(cid, st, f"{m['name']} pinged as Alay")
-            return True
-        if not st.get("test"):
-            set_row_status(cid, d, m["user_id"], "missed")
-        S.add_log(cid, "alay_dm_failed", m["user_id"])
-        add_event(cid, st, f"Couldn't DM {m['name']} (they may need to press Start on the bot) - trying someone else")
-        prev_name = None
+        else:
+            if not st.get("test"):
+                set_row_status(cid, d, m["user_id"], "missed")
+            S.add_log(cid, "alay_dm_failed", m["user_id"])
+            add_event(cid, st, f"Couldn't DM {m['name']} (they may need to press Start on the bot)")
+    if not sent:
+        await finish(bot, cid, st)
+        return False
+    st["alay_ids"] = sent
+    st["alay_id"] = sent[0]
+    S.dirty.add("PA_State")
+    return True
 
 
 def choose_pair(cid, st, prefer=None):
-    """Return (caller_uid, target_uid) or None. `prefer` is the newly woken person."""
-    rem = unwoken(cid, st)
+    """Return an idle caller and a target not already assigned to another caller."""
+    active = active_calls(st)
+    busy_callers = {c["caller"] for c in active}
+    assigned_targets = {c["target"] for c in active}
+    rem = [m for m in unwoken(cid, st) if m["user_id"] not in assigned_targets]
     if not rem:
         return None
     stalled = set(st["stalled"])
     callers = [a["uid"] for a in st["awake"]
-               if a["uid"] not in stalled and member(cid, a["uid"]) and member(cid, a["uid"])["active"]]
+               if a["uid"] not in stalled and a["uid"] not in busy_callers
+               and member(cid, a["uid"]) and member(cid, a["uid"])["active"]]
     if not callers:
         return None
     order = ([prefer] if prefer in callers else []) + sorted(
@@ -720,16 +778,16 @@ def choose_pair(cid, st, prefer=None):
         cs = candidates(c)
         if cs:
             return c, random.choice(cs)["user_id"]
-    # Everybody has tried everybody who is left: start a fresh round.
+    # Everybody has tried everyone currently available; reset rounds and start a fresh one.
     st["tried"] = {}
     c = order[0]
     cs = [m for m in rem if m["user_id"] != c]
     return (c, random.choice(cs)["user_id"]) if cs else None
 
 
-async def dm_caller(bot, cid, st, note=None):
+async def dm_caller(bot, cid, st, note=None, cur=None):
     g = S.groups[cid]
-    cur = st["cur"]
+    cur = cur or st["cur"]
     m = member(cid, cur["target"])
     target = m["name"] if m else name_of(cid, cur["target"])
     link = telegram_link(cur["target"], m["username"] if m else "")
@@ -754,35 +812,39 @@ async def dm_caller(bot, cid, st, note=None):
 
 async def next_pair(bot, cid, st, prefer=None, note=None):
     g = S.groups[cid]
-    while True:
+    calls = active_calls(st)
+    while len(calls) < parallel_limit(cid, st):
         pair = choose_pair(cid, st, prefer)
         if not pair:
+            if calls:
+                break
             await finish(bot, cid, st)
             return
         caller, target = pair
-        st["cur"] = {"caller": caller, "target": target, "attempt": 1,
-                     "deadline": in_minutes(g, g["attempt_wait"]), "msg_id": None}
+        cur = {"caller": caller, "target": target, "attempt": 1,
+               "deadline": in_minutes(g, g["attempt_wait"]), "msg_id": None}
+        calls.append(cur)
+        set_active_calls(st, calls)
         st["calls"][str(caller)] = st["calls"].get(str(caller), 0) + 1
         S.dirty.add("PA_State")
         S.add_log(cid, "assigned", caller, target)
-        if await dm_caller(bot, cid, st, note):
-            return
+        if await dm_caller(bot, cid, st, note, cur=cur):
+            prefer, note = None, None
+            continue
+        remove_active_call(st, cur)
         st["stalled"].append(caller)
         S.add_log(cid, "caller_dm_failed", caller)
         add_event(cid, st, f"Couldn't message {name_of(cid, caller)} anymore - calls handed to someone else")
+        calls = active_calls(st)
         prefer, note = None, None
 
 
-async def fail_attempt(bot, cid, st, silent):
-    """A caller's current attempt on their target didn't pan out - either they tapped
-    "No answer" (silent=False) or the attempt_wait deadline passed with no response from
-    the caller at all (silent=True). Both are treated the same way: once max_attempts is
-    hit, the SAME caller keeps their calling duty and simply gets a new target - a caller
-    never loses their duty just for being slow or quiet. The only things that move calling
-    duty to someone else are the bot genuinely failing to deliver a DM to them (see
-    next_pair), someone new waking up, or the relay ending."""
+async def fail_attempt(bot, cid, st, silent, cur=None):
+    """Retry or reassign one caller's active attempt."""
     g = S.groups[cid]
-    cur = st["cur"]
+    cur = cur or (active_calls(st)[0] if active_calls(st) else None)
+    if not cur:
+        return
     caller, target = cur["caller"], cur["target"]
     await strip_kb(bot, caller, cur.get("msg_id"))
     S.add_log(cid, "attempt_failed", caller, target, f"attempt {cur['attempt']} silent={silent}")
@@ -792,13 +854,15 @@ async def fail_attempt(bot, cid, st, silent):
         st["tried"].setdefault(str(caller), []).append(target)
         add_event(cid, st, f"{name_of(cid, caller)} tried {name_of(cid, target)} "
                            f"{g['max_attempts']}x with no answer - moving on")
+        remove_active_call(st, cur)
         note = (f"{g['max_attempts']} attempts used for {esc(name_of(cid, target))}. "
                 f"Here's someone else:")
         await next_pair(bot, cid, st, prefer=caller, note=note)
         return
     cur["attempt"] += 1
     cur["deadline"] = in_minutes(g, g["attempt_wait"])
-    if not await dm_caller(bot, cid, st, note="Let's try again."):
+    if not await dm_caller(bot, cid, st, note="Let's try again.", cur=cur):
+        remove_active_call(st, cur)
         st["stalled"].append(caller)
         add_event(cid, st, f"Couldn't message {name_of(cid, caller)} anymore - calls handed to someone else")
         await next_pair(bot, cid, st)
@@ -807,15 +871,13 @@ async def fail_attempt(bot, cid, st, silent):
 async def finish(bot, cid, st):
     if st["phase"] == "done":
         return
-    if st.get("cur"):
-        await strip_kb(bot, st["cur"]["caller"], st["cur"].get("msg_id"))
+    for cur in list(active_calls(st)):
+        await strip_kb(bot, cur["caller"], cur.get("msg_id"))
     st["phase"] = "done"
-    st["cur"] = None
+    set_active_calls(st, [])
     S.dirty.add("PA_State")
     rem = unwoken(cid, st)
     S.add_log(cid, "run_finished", detail=f"awake={len(st['awake'])} remaining={len(rem)}")
-    # The group only ever sees the button during the relay - take it down, and send the
-    # recap to the group's admins privately instead of posting it in the group.
     await clear_group_button(bot, cid, st)
     await send_to_admins(bot, cid, build_summary(cid, st))
 
@@ -838,11 +900,14 @@ async def advance(bot, cid, st):
         return
     if st["phase"] == "alay_wait":
         if now >= from_iso(st["alay_deadline"]):
-            prev = st["alay_id"]
+            prev_ids = st.get("alay_ids") or [st["alay_id"]]
+            prev_names = ", ".join(name_of(cid, uid) for uid in prev_ids)
             if not st.get("test"):
-                set_row_status(cid, d, prev, "missed")
-            S.add_log(cid, "alay_missed", prev)
-            await activate_alay(bot, cid, st, d, prev_name=name_of(cid, prev))
+                for uid in prev_ids:
+                    set_row_status(cid, d, uid, "missed")
+            for uid in prev_ids:
+                S.add_log(cid, "alay_missed", uid)
+            await activate_alay(bot, cid, st, d, prev_name=prev_names)
         elif now >= from_iso(st["next_nag"]):
             st["next_nag"] = in_minutes(g, g["nag_min"])
             S.dirty.add("PA_State")
@@ -850,12 +915,17 @@ async def advance(bot, cid, st):
             # a burst can take 10+ seconds and advance() runs under the shared LOCK
             # (via tick()), so awaiting it inline would stall every other group and
             # every button press for that long.
-            asyncio.create_task(run_alay_burst(bot, cid, st["date"], st["alay_id"]))
+            for alay_uid in (st.get("alay_ids") or [st["alay_id"]]):
+                if alay_uid not in {a["uid"] for a in st["awake"]}:
+                    asyncio.create_task(run_alay_burst(bot, cid, st["date"], alay_uid))
     elif st["phase"] == "chain":
-        if st.get("cur") is None:
+        if not active_calls(st):
             await next_pair(bot, cid, st)
-        elif now >= from_iso(st["cur"]["deadline"]):
-            await fail_attempt(bot, cid, st, silent=True)
+        else:
+            for cur in list(active_calls(st)):
+                if cur in active_calls(st) and now >= from_iso(cur["deadline"]):
+                    await fail_attempt(bot, cid, st, silent=True, cur=cur)
+            await next_pair(bot, cid, st)
 
 
 # --------------------------------------------------------------------------------------
@@ -1032,18 +1102,22 @@ async def cb_alay(update: Update, context: ContextTypes.DEFAULT_TYPE):
             set_row_status(cid, d, uid, "served")
         if starting_now:
             st["phase"] = "chain"
-        cur = st.get("cur")
-        if cur and cur["target"] == uid:
-            # They were just being called and woke up on their own - free up the caller.
-            await strip_kb(context.bot, cur["caller"], cur.get("msg_id"))
-            st["cur"] = None
+        awake_ids = {a["uid"] for a in st["awake"]}
+        for alay_uid in (st.get("alay_ids") or [st.get("alay_id")]):
+            if (starting_now and alay_uid not in (None, uid) and alay_uid not in awake_ids
+                    and not st.get("test")):
+                set_row_status(cid, d, alay_uid, "missed")
+        for cur in list(active_calls(st)):
+            if cur["target"] == uid:
+                # They were just being called and woke up on their own - free up the caller.
+                await strip_kb(context.bot, cur["caller"], cur.get("msg_id"))
+                remove_active_call(st, cur)
         S.dirty.add("PA_State")
         S.add_log(cid, "alay_awake" if uid in st["alay_tried"] else "self_awake", uid)
         if not st["pray"]:
             st["pray"] = True
-            await say(context.bot, cid, f"🙏 {PRAY_TEXT}.")
-        if starting_now or st.get("cur") is None:
-            await next_pair(context.bot, cid, st, prefer=uid)
+            await say(context.bot, cid, f"🙏 {esc(S.groups[cid].get('pray_text', PRAY_TEXT))}")
+        await next_pair(context.bot, cid, st, prefer=uid)
 
 
 async def cb_result(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1056,9 +1130,8 @@ async def cb_result(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     async with LOCK:
         st = S.state.get(cid)
-        cur = st.get("cur") if st else None
-        if (not st or st["date"] != day or st["phase"] != "chain" or not cur
-                or cur["caller"] != q.from_user.id or cur["target"] != target):
+        cur = next((c for c in active_calls(st) if c["caller"] == q.from_user.id and c["target"] == target), None) if st else None
+        if (not st or st["date"] != day or st["phase"] != "chain" or not cur):
             await q.answer("This step has already moved on.")
             return
         g = S.groups[cid]
@@ -1067,7 +1140,7 @@ async def cb_result(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.answer("Great!")
             if target not in {a["uid"] for a in st["awake"]}:
                 st["awake"].append({"uid": target, "ts": now_local(g).isoformat()})
-            st["cur"] = None
+            remove_active_call(st, cur)
             S.dirty.add("PA_State")
             S.add_log(cid, "target_awake", q.from_user.id, target)
             # Award tracking: credit the caller with successfully waking one more person.
@@ -1090,7 +1163,7 @@ async def cb_result(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                           parse_mode=ParseMode.HTML)
             except TelegramError:
                 pass
-            await fail_attempt(context.bot, cid, st, silent=False)
+            await fail_attempt(context.bot, cid, st, silent=False, cur=cur)
 
 
 # --------------------------------------------------------------------------------------
@@ -1189,9 +1262,9 @@ async def cmd_setup(update, context):
     g = S.groups[cid]
     await update.effective_message.reply_text(
         f"✅ Predawn wake-up is set up for this group.\nWake time: {g['wake']}, end time: {g['end']} "
-        f"({g['tz']}). DM me privately and use /pd_set wake HH:MM or /pd_set end HH:MM to change them.\n\n"
+        f"({g['tz']}). DM me privately to change the settings, including the Let's pray message with /pd_set pray TEXT.\n\n"
         f"Everyone must join below (Mon-Sat runs). From here on, manage things by messaging me "
-        f"privately - this group will only show the Join button and the weekly schedule.")
+        f"privately - the group will also get the awake button and the configured prayer message.")
     await send_join_prompt(update, context, cid)
 
 
@@ -1227,6 +1300,7 @@ HELP_TEXT = (
     "/pd_settings - show settings\n\n"
     "<b>Admins (also DM me for these)</b>\n"
     "/pd_set wake|end|deadline HH:MM  |  tz Area/City  |  alay_wait|attempt_wait|attempts|nag|burst N\n"
+    "/pd_set pray TEXT - change the group's Let's pray message\n"
     "/pd_regen - reshuffle the remaining days\n"
     "/pd_start - start today's run now (testing)\n"
     "/pd_test - start a test run that ignores wake/end/deadline entirely\n"
@@ -1332,7 +1406,8 @@ def settings_text(g):
             f"Timezone: {g['tz']}\n"
             f"Alay has {g['alay_wait']} min to respond - a burst of {g['burst_count']} pings "
             f"every {g['nag_min']} min\n"
-            f"Callers report within {g['attempt_wait']} min, {g['max_attempts']} attempts per person")
+            f"Callers report within {g['attempt_wait']} min, {g['max_attempts']} attempts per person\n"
+            f"Let's pray message: {esc(g.get('pray_text', PRAY_TEXT))}")
 
 
 async def cmd_settings(update, context):
@@ -1364,6 +1439,14 @@ def apply_setting(g, key, value):
             return "Unknown timezone. Example: Asia/Manila"
         g["tz"] = value
         return None
+    if key in ("pray", "prayer"):
+        text = value.strip()
+        if not text:
+            return "Give the message to post, e.g. /pd_set pray Excerpt from this week's sermon."
+        if len(text) > 3500:
+            return "The message must be 3,500 characters or fewer."
+        g["pray_text"] = text
+        return None
     fields = {"alay_wait": ("alay_wait", 1, 60), "attempt_wait": ("attempt_wait", 1, 30),
               "attempts": ("max_attempts", 1, 10), "nag": ("nag_min", 1, 10),
               "burst": ("burst_count", 1, 20)}
@@ -1377,7 +1460,7 @@ def apply_setting(g, key, value):
             return f"Please choose a number from {lo} to {hi}."
         g[field] = n
         return None
-    return "Unknown setting. Use: wake, end, deadline, tz, alay_wait, attempt_wait, attempts, nag, burst."
+    return "Unknown setting. Use: wake, end, deadline, tz, alay_wait, attempt_wait, attempts, nag, burst, pray."
 
 
 async def cmd_set(update, context, forced_key=None):
@@ -1390,10 +1473,11 @@ async def cmd_set(update, context, forced_key=None):
     if len(args) < 2:
         await update.effective_message.reply_text(
             "Usage: /pd_set wake 03:30  |  end 04:30  |  deadline 04:50  |  tz Asia/Manila  |  "
-            "alay_wait 10  |  attempt_wait 5  |  attempts 3  |  nag 2  |  burst 10")
+            "alay_wait 10  |  attempt_wait 5  |  attempts 3  |  nag 2  |  burst 10  |  pray <message>")
         return
+    value = " ".join(args[1:])
     async with LOCK:
-        err = apply_setting(S.groups[cid], args[0], args[1])
+        err = apply_setting(S.groups[cid], args[0], value)
         if not err:
             S.dirty.add("PA_Groups")
     if err:
@@ -1495,12 +1579,15 @@ async def cmd_status(update, context):
     elif st["phase"] == "done":
         text = "Today's run has finished.\n\n" + render_list(cid, st)
     elif st["phase"] == "alay_wait":
-        text = f"Waiting for {esc(name_of(cid, st['alay_id']))} (Alay) to confirm."
+        alays = st.get("alay_ids") or [st.get("alay_id")]
+        names = ", ".join(esc(name_of(cid, uid)) for uid in alays if uid)
+        text = f"Waiting for {names} (Alay) to confirm."
     else:
-        cur = st.get("cur")
-        extra = (f"\n{esc(name_of(cid, cur['caller']))} is calling {esc(name_of(cid, cur['target']))} "
-                 f"(attempt {cur['attempt']}/{g['max_attempts']})") if cur else ""
-        text = render_list(cid, st) + extra
+        assignments = active_calls(st)
+        extra = "\n".join(
+            f"{esc(name_of(cid, c['caller']))} is calling {esc(name_of(cid, c['target']))} "
+            f"(attempt {c['attempt']}/{g['max_attempts']})" for c in assignments)
+        text = render_list(cid, st) + (("\n" + extra) if extra else "")
     await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML)
 
 
