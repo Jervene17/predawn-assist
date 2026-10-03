@@ -149,13 +149,15 @@
     <p>
       The bot runs a <strong>predawn wake-up relay</strong> for a group, Monday–Saturday.
       Each day, one member — the <strong>Alay</strong> — is scheduled to wake up first.
-      Once the Alay confirms they're awake, the bot hands them names of other members to
-      call on Telegram, one at a time, until everyone in the group has been woken up or
-      the group's end time is reached.
+      Groups with more than five active members get two Alay messages at a time. As people
+      confirm they're awake, the bot assigns callers in parallel and never assigns the same
+      person to two callers at once, until everyone has been woken up or the group's deadline
+      is reached.
     </p>
     <p class="muted">
       Everything happens through <strong>private messages (DMs)</strong> with the bot —
-      the group chat itself only ever shows the Join button and the weekly schedule.
+      the group chat shows the Join button, weekly schedule, awake button, and the group's
+      customizable prayer message.
     </p>
   </section>
 
@@ -194,10 +196,11 @@
   <section id="morning">
     <h2>A typical morning</h2>
     <ol>
-      <li>At the group's wake time, the bot DMs that day's scheduled Alay.</li>
-      <li>The Alay taps <strong>"I'm awake"</strong>.</li>
-      <li>The group is notified, and the Alay is privately given the name of one other
-        member to call on Telegram.</li>
+      <li>At the group's wake time, the bot DMs the scheduled Alay (and a second Alay when
+        more than five active members have joined).</li>
+      <li>Anyone in the group who is awake taps <strong>"I'm awake"</strong>.</li>
+      <li>Each awake member can receive a different person to call on Telegram; no target is
+        assigned to two callers at the same time.</li>
       <li>The Alay reports back: <strong>awake</strong> or <strong>no answer</strong>
         (up to 3 attempts per person, by default).</li>
       <li>Once someone is confirmed awake, <em>they</em> get the next name to call — the
@@ -251,6 +254,7 @@
       <tr><td><code>/pd_set attempts N</code></td><td>Max call attempts per person before someone else is assigned.</td></tr>
       <tr><td><code>/pd_set nag N</code></td><td>Minutes between reminder bursts sent to the Alay.</td></tr>
       <tr><td><code>/pd_set burst N</code></td><td>Number of reminder pings sent per burst.</td></tr>
+      <tr><td><code>/pd_set pray message</code></td><td>Changes the message posted in the group when the first person taps "I'm awake". Use this for a prayer or a sermon excerpt.</td></tr>
       <tr><td><code>/pd_regen</code></td><td>Reshuffles the remaining days of the current (or next) week's schedule.</td></tr>
       <tr><td><code>/pd_start</code></td><td>Starts today's run immediately — handy for testing.</td></tr>
       <tr><td><code>/pd_stop</code></td><td>Ends today's run right away.</td></tr>
