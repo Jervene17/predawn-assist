@@ -319,6 +319,17 @@ def name_of(cid, uid):
     return m["name"] if m else str(uid)
 
 
+def telegram_link(uid, username):
+    """A tappable link that opens a chat with this person directly. Prefers their
+    @username (works everywhere); falls back to a tg://user?id= deep link keyed on
+    their Telegram user ID when they haven't set a public username - this opens
+    correctly in Telegram's own apps as long as the two of them share a chat (they do:
+    the Predawn group), though it won't work from outside the Telegram app itself."""
+    if username:
+        return f"https://t.me/{username}"
+    return f"tg://user?id={uid}"
+
+
 def is_skipping(m, d):
     return d.isoformat() in m["skip"]
 
@@ -579,11 +590,32 @@ async def start_run(bot, cid, test=False):
         st["list_msg_id"] = msg.message_id
 
 
-async def dm_alay(bot, cid, st, m, nag=False):
+async def group_chat_link(bot, cid, st):
+    """Return a Telegram link to the group, preferably focused on the awake button."""
+    message_id = st.get("list_msg_id")
+    try:
+        chat = await bot.get_chat(cid)
+    except TelegramError:
+        chat = None
+
+    if chat and chat.username:
+        suffix = f"/{message_id}" if message_id else ""
+        return f"https://t.me/{chat.username}{suffix}"
+    chat_id = str(cid)
+    if message_id and chat_id.startswith("-100"):
+        return f"https://t.me/c/{chat_id[4:]}/{message_id}"
+    if chat and chat.invite_link:
+        return chat.invite_link
+    return None
+
+
+async def dm_alay(bot, cid, st, m, nag=False, group_link=None):
     g = S.groups[cid]
     if nag:
         text = (f"⏰ <b>{esc(m['name'])}</b>, still sleeping? You're today's Alay for "
                 f"<b>{esc(g['title'])}</b>. Tap \"I'm awake\" in the group chat once you're up.")
+        if group_link:
+            text += f' <a href="{esc(group_link)}">Open group chat</a>.'
     else:
         text = (f"🌅 <b>Good morning, {esc(m['name'])}!</b>\nYou're today's Alay for "
                 f"<b>{esc(g['title'])}</b>. Tap \"I'm awake\" in the group chat once you're up.")
@@ -607,6 +639,7 @@ async def run_alay_burst(bot, cid, day, uid):
     g = S.groups.get(cid)
     if not g:
         return
+    group_link = await group_chat_link(bot, cid, S.state.get(cid, {}))
     count = max(1, g.get("burst_count", DEFAULTS["burst_count"]))
     for i in range(count):
         async with LOCK:
@@ -618,7 +651,7 @@ async def run_alay_burst(bot, cid, day, uid):
             m = member(cid, uid)
             if not m:
                 return
-            await dm_alay(bot, cid, st, m, nag=True)
+            await dm_alay(bot, cid, st, m, nag=True, group_link=group_link)
         if i < count - 1:
             await asyncio.sleep(BURST_GAP_SECONDS)
 
@@ -697,16 +730,22 @@ def choose_pair(cid, st, prefer=None):
 async def dm_caller(bot, cid, st, note=None):
     g = S.groups[cid]
     cur = st["cur"]
-    target = name_of(cid, cur["target"])
+    m = member(cid, cur["target"])
+    target = m["name"] if m else name_of(cid, cur["target"])
+    link = telegram_link(cur["target"], m["username"] if m else "")
     text = ((note + "\n\n") if note else "") + (
-        f"📞 <b>[{esc(g['title'])}]</b>\nPlease call <b>{esc(target)}</b> on Telegram now to wake them up.\n"
+        f"📞 <b>[{esc(g['title'])}]</b>\nPlease call <a href=\"{esc(link)}\">{esc(target)}</a> "
+        f"on Telegram now to wake them up.\n"
         f"Attempt {cur['attempt']} of {g['max_attempts']}")
-    kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton(f"✅ {target[:20]} is awake",
-                             callback_data=f"pdok:{cid}:{st['date']}:{cur['target']}"),
-        InlineKeyboardButton("❌ No answer",
-                             callback_data=f"pdno:{cid}:{st['date']}:{cur['target']}"),
-    ]])
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"💬 Open chat with {target[:20]}", url=link)],
+        [
+            InlineKeyboardButton(f"✅ {target[:20]} is awake",
+                                 callback_data=f"pdok:{cid}:{st['date']}:{cur['target']}"),
+            InlineKeyboardButton("❌ No answer",
+                                 callback_data=f"pdno:{cid}:{st['date']}:{cur['target']}"),
+        ],
+    ])
     msg = await send_dm(bot, cur["caller"], text, kb)
     if msg:
         cur["msg_id"] = msg.message_id
